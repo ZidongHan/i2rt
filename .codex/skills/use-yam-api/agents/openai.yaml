@@ -1,0 +1,4 @@
+interface:
+  display_name: "Use Standard YAM API"
+  short_description: "Use and trace the standard YAM Python API"
+  default_prompt: "Use $use-yam-api to implement or review code against the standard YAM API."

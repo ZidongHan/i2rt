@@ -55,6 +55,8 @@ htmlcov/
 *.cache
 *.pid
 *.lock
+/tmp/
+# /i2rt/tmp/
 # Track the uv lockfile so `uv-sync --locked` is reproducible on a fresh clone.
 !uv.lock
 
