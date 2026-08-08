@@ -19,7 +19,12 @@ _MAX_TORQUE = {
 _DEFAULT_MAX_TORQUE = 20.0  # Nm — same threshold as MotorChainRobot
 NUM_SAMPLES = 20
 
-ALL_ARM_GRIPPER_COMBOS = [(arm, gripper) for arm in ArmType for gripper in GripperType if arm != ArmType.NO_ARM]
+ALL_ARM_GRIPPER_COMBOS = [
+    (arm, gripper)
+    for arm in ArmType
+    for gripper in GripperType
+    if arm != ArmType.NO_ARM and not gripper.is_custom_complete_model
+]
 
 
 def _combo_id(val: object) -> str:

@@ -14,6 +14,7 @@ from i2rt.motor_drivers.dm_driver import (
     MotorInfo,
     PassiveEncoderInfo,
 )
+from i2rt.robots.model_coordinates import ModelCoordinateAdapter
 from i2rt.robots.robot import Robot
 from i2rt.robots.utils import ArmType, GripperForceLimiter, GripperType, JointMapper, detect_gripper_limits
 from i2rt.utils.mujoco_utils import MuJoCoKDL
@@ -80,6 +81,7 @@ class MotorChainRobot(Robot):
         ] = None,  # per-joint Coulomb friction (Nm); applied as coulomb_friction * sign(q_dot)
         use_coulomb_friction: bool = False,  # if True, add the Coulomb friction feedforward in the grav-comp loop
         joint_limits: Optional[np.ndarray] = None,  # if provided, override the mujoco xml joint limits
+        model_coordinate_adapter: Optional[ModelCoordinateAdapter] = None,
         gripper_limits: Optional[np.ndarray] = None,  # [closed, open]
         limit_gripper_force: float = -1,  # whether to limit the gripper effort when it is blocked. -1 means no limit.
         clip_motor_torque: float = np.inf,  # clip the offset motor torque, real motor torque can still still be larger than this setting depending on the motor onboard PID loop
@@ -106,6 +108,12 @@ class MotorChainRobot(Robot):
         self._set_realtime_and_pin_callback = set_realtime_and_pin_callback
         self._arm_type = arm_type
         self._gripper_type = gripper_type
+        self._model_coordinate_adapter = model_coordinate_adapter
+        if model_coordinate_adapter is not None and len(model_coordinate_adapter.public_names) != len(motor_chain):
+            raise ValueError(
+                "model coordinate public dimension "
+                f"{len(model_coordinate_adapter.public_names)} != motor chain dimension {len(motor_chain)}"
+            )
         self.temp_record_flag = temp_record_flag
         if gripper_index is not None:
             assert gripper_index == len(motor_chain) - 1, (
@@ -316,6 +324,9 @@ class MotorChainRobot(Robot):
             "gravity_comp_factor": self.gravity_comp_factor,
             "gripper_index": self._gripper_index,
             "enable_auto_recovery": getattr(self.motor_chain, "enable_auto_recovery", False),
+            "model_coordinate_schema": (
+                self._model_coordinate_adapter.SCHEMA_VERSION if self._model_coordinate_adapter is not None else None
+            ),
         }
         if self._gripper_index is not None:
             info["limit_gripper_effort"] = self._limit_gripper_force
@@ -508,6 +519,18 @@ class MotorChainRobot(Robot):
         if joint_state is None or not self.use_gravity_comp:
             return np.zeros(len(self.motor_chain))
         elif self.use_gravity_comp:
+            if self._model_coordinate_adapter is not None:
+                public_q = np.asarray(joint_state.pos, dtype=float)
+                model_q = self._model_coordinate_adapter.public_position_to_model(public_q)
+                model_torque = self.kdl.compute_inverse_dynamics(
+                    model_q,
+                    np.zeros(self._model_coordinate_adapter.model_nv),
+                    np.zeros(self._model_coordinate_adapter.model_nv),
+                )
+                public_torque = self._model_coordinate_adapter.model_effort_to_public(model_torque)
+                if np.max(np.abs(public_torque)) > 25.0:
+                    raise RuntimeError(f"{self}: too large torques {public_torque}")
+                return public_torque
             q = joint_state.pos[: self._gripper_index] if self._gripper_index is not None else joint_state.pos
             t = self.kdl.compute_inverse_dynamics(q, np.zeros(q.shape), np.zeros(q.shape))
             # print gravity torque to 2f

@@ -21,6 +21,12 @@ _CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config")
 
 logger = logging.getLogger(__name__)
 
+_GRIPPER_HARDWARE_CONFIG_NAMES = {
+    "linear_4310_soft": "linear_4310",
+    "linear_4310_soft_iphone_15_pro": "linear_4310",
+    "linear_4310_soft_iphone_15_pro_max": "linear_4310",
+}
+
 
 # ---------------------------------------------------------------------------
 # Per-gripper hardware config — loaded from YAML at runtime.
@@ -51,7 +57,8 @@ def _load_gripper_config(gripper_type_value: str, arm_type: "ArmType") -> _Gripp
     """
     arm_type_value = arm_type.family
     arm_version = arm_type.version
-    config_path = os.path.join(_CONFIG_DIR, f"{gripper_type_value}.yml")
+    hardware_config_name = _GRIPPER_HARDWARE_CONFIG_NAMES.get(gripper_type_value, gripper_type_value)
+    config_path = os.path.join(_CONFIG_DIR, f"{hardware_config_name}.yml")
     logger.info(f"Loading gripper config from {config_path} (arm={arm_type_value})")
     with open(config_path) as f:
         raw = yaml.safe_load(f)
@@ -192,6 +199,7 @@ from i2rt.robot_models import (
     GRIPPER_NO_GRIPPER_PATH,
     GRIPPER_TEACHING_HANDLE_PATH,
     get_arm_xml_path,
+    get_assembled_yam_paths,
 )
 
 
@@ -478,6 +486,9 @@ class GripperType(enum.Enum):
     LINEAR_3507 = "linear_3507"  # a 3507 motor with a linear actuator
     LINEAR_4310 = "linear_4310"  # a 4310 motor with a linear actuator
     FLEXIBLE_4310 = "flexible_4310"  # a 4310 motor with flexible soft tips
+    LINEAR_4310_SOFT = "linear_4310_soft"
+    LINEAR_4310_SOFT_IPHONE_15_PRO = "linear_4310_soft_iphone_15_pro"
+    LINEAR_4310_SOFT_IPHONE_15_PRO_MAX = "linear_4310_soft_iphone_15_pro_max"
 
     # technically not a gripper
     YAM_TEACHING_HANDLE = "yam_teaching_handle"
@@ -504,7 +515,28 @@ class GripperType(enum.Enum):
         cfg = _load_gripper_config(self.value, arm_type)
         return cfg.needs_calibration
 
+    @property
+    def hardware_config_name(self) -> str:
+        """Authoritative gripper hardware YAML name for this public assembly type."""
+        return _GRIPPER_HARDWARE_CONFIG_NAMES.get(self.value, self.value)
+
+    @property
+    def is_custom_complete_model(self) -> bool:
+        return self.value in _GRIPPER_HARDWARE_CONFIG_NAMES
+
+    def get_complete_model_paths(self, arm_type: "ArmType") -> tuple[str, str]:
+        """Complete MJCF and interface paths for custom assemblies on standard YAM."""
+        if not self.is_custom_complete_model:
+            raise ValueError(f"{self.value!r} is not a custom complete-model assembly")
+        if arm_type != ArmType.YAM:
+            raise ValueError(f"Custom assembly {self.value!r} supports only ArmType.YAM, got {arm_type.value!r}")
+        return get_assembled_yam_paths(self.value)
+
     def get_xml_path(self) -> str:
+        if self.is_custom_complete_model:
+            raise ValueError(
+                f"Custom assembly {self.value!r} is a complete robot model; use get_complete_model_paths(ArmType.YAM)"
+            )
         _xml_map = {
             GripperType.CRANK_4310: GRIPPER_CRANK_4310_PATH,
             GripperType.LINEAR_3507: GRIPPER_LINEAR_3507_PATH,

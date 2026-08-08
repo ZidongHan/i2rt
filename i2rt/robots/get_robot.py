@@ -3,6 +3,7 @@ import xml.etree.ElementTree as ET
 from functools import partial
 from typing import Any, Callable, Optional
 
+import mujoco
 import numpy as np
 
 from i2rt.motor_drivers.dm_driver import (
@@ -12,6 +13,7 @@ from i2rt.motor_drivers.dm_driver import (
     PassiveEncoderReader,
     ReceiveMode,
 )
+from i2rt.robots.model_coordinates import ModelCoordinateAdapter
 from i2rt.robots.motor_chain_robot import MotorChainRobot
 from i2rt.robots.robot import Robot
 from i2rt.robots.utils import (
@@ -183,19 +185,37 @@ def get_yam_robot(
     if with_gripper:
         effective_gravity_comp = np.append(effective_gravity_comp, 1.0)
 
-    model_path = combine_arm_and_gripper_xml(
-        arm_type,
-        gripper_type,
-        ee_mass=ee_mass,
-        ee_inertia=ee_inertia,
-    )
+    model_coordinate_adapter: Optional[ModelCoordinateAdapter] = None
+    if gripper_type.is_custom_complete_model:
+        if ee_mass is not None or ee_inertia is not None:
+            raise ValueError("complete custom assemblies do not support runtime end-effector inertial overrides")
+        model_path, interface_path = gripper_type.get_complete_model_paths(arm_type)
+        model_coordinate_adapter = ModelCoordinateAdapter.from_path(interface_path, model_path)
+    else:
+        model_path = combine_arm_and_gripper_xml(
+            arm_type,
+            gripper_type,
+            ee_mass=ee_mass,
+            ee_inertia=ee_inertia,
+        )
 
     # Load limits for motor-driven joints only (arm joints + last wrist joint from gripper XML).
-    all_joint_limits = _load_joint_limits_from_xml(arm_type.get_xml_path(), gripper_type.get_xml_path())
+    # Real commands retain the official arm model's physical envelope.  A complete
+    # custom model supplies a separate exact model envelope for simulation/IK.
+    limit_paths = (arm_type.get_xml_path(),)
+    if not gripper_type.is_custom_complete_model:
+        limit_paths += (gripper_type.get_xml_path(),)
+    all_joint_limits = _load_joint_limits_from_xml(*limit_paths)
     n_arm_joints = len(hw.motor_list)
     joint_limits = all_joint_limits[:n_arm_joints]
-    joint_limits[:, 0] -= 0.15  # safety buffer
-    joint_limits[:, 1] += 0.15
+    if not gripper_type.is_custom_complete_model:
+        # Preserve the existing stock-route command envelope byte-for-byte.
+        joint_limits[:, 0] -= 0.15
+        joint_limits[:, 1] += 0.15
+    sim_joint_limits = joint_limits
+    if model_coordinate_adapter is not None:
+        complete_model = mujoco.MjModel.from_xml_path(model_path)
+        sim_joint_limits = model_coordinate_adapter.public_position_limits(complete_model)[:n_arm_joints]
 
     # Build mutable lists from the frozen arm config, then extend for gripper.
     motor_list = [[can_id, mtype] for can_id, mtype in hw.motor_list]
@@ -240,10 +260,11 @@ def get_yam_robot(
         return SimRobot(
             xml_path=model_path,
             n_dofs=len(motor_list),
-            joint_limits=joint_limits,
+            joint_limits=sim_joint_limits,
             gripper_index=n_arm_joints if with_gripper else None,
             gripper_limits=sim_gripper_limits,
             gravity_comp_factor=sim_grav_comp,
+            model_coordinate_adapter=model_coordinate_adapter,
         )
 
     # --- Real hardware path ---------------------------------------------------
@@ -291,6 +312,7 @@ def get_yam_robot(
         grav_comp_kd=grav_comp_kd,
         coulomb_friction=coulomb_friction,
         use_coulomb_friction=use_coulomb_friction,
+        model_coordinate_adapter=model_coordinate_adapter,
         zero_gravity_mode=zero_gravity_mode,
         joint_state_saver_factory=joint_state_saver_factory,
         set_realtime_and_pin_callback=set_realtime_and_pin_callback,

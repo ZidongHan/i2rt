@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 import mujoco
 import numpy as np
 
+from i2rt.robots.model_coordinates import ModelCoordinateAdapter
 from i2rt.robots.robot import Robot
 
 # Simulated motor temperatures (°C) — typical idle values for real hardware.
@@ -51,12 +52,18 @@ class SimRobot(Robot):
         initial_qpos: Optional[np.ndarray] = None,
         gravity_comp_factor: Optional[np.ndarray] = None,
         control_freq: float = 200.0,
+        model_coordinate_adapter: Optional[ModelCoordinateAdapter] = None,
     ) -> None:
         self.xml_path = xml_path
         self._n_dofs = n_dofs
         self._joint_limits = joint_limits
         self._gripper_index = gripper_index
         self._gripper_limits = gripper_limits
+        self._model_coordinate_adapter = model_coordinate_adapter
+        if model_coordinate_adapter is not None and len(model_coordinate_adapter.public_names) != n_dofs:
+            raise ValueError(
+                f"model coordinate public dimension {len(model_coordinate_adapter.public_names)} != n_dofs {n_dofs}"
+            )
 
         self._model = mujoco.MjModel.from_xml_path(xml_path)
         self._data = mujoco.MjData(self._model)
@@ -66,7 +73,7 @@ class SimRobot(Robot):
         # is 0 = closed, 1 = open, but the underlying MuJoCo joint range may
         # differ (e.g. [-0.048, 0] for flexible grippers).
         self._gripper_qpos_range = None
-        if gripper_index is not None and gripper_index < self._model.njnt:
+        if model_coordinate_adapter is None and gripper_index is not None and gripper_index < self._model.njnt:
             jnt_lo, jnt_hi = self._model.jnt_range[gripper_index]
             if jnt_lo != 0.0 or jnt_hi != 1.0:
                 self._gripper_qpos_range = (float(jnt_lo), float(jnt_hi))
@@ -76,9 +83,8 @@ class SimRobot(Robot):
         self._qvel = np.zeros(n_dofs)
 
         # Push the initial state into MuJoCo so FK is consistent.
-        n = min(n_dofs, self._model.nq)
         mj_qpos = self._cmd_to_mj_qpos(self._qpos)
-        self._data.qpos[:n] = mj_qpos[:n]
+        self._data.qpos[: len(mj_qpos)] = mj_qpos
         mujoco.mj_forward(self._model, self._data)
 
         # Scratch MjData for inverse dynamics (reused every call).
@@ -100,6 +106,8 @@ class SimRobot(Robot):
         For the gripper joint, [0, 1] is mapped to the actual MuJoCo joint range.
         All other joints pass through unchanged.
         """
+        if self._model_coordinate_adapter is not None:
+            return self._model_coordinate_adapter.public_position_to_model(cmd)
         mj = cmd.copy()
         if self._gripper_qpos_range is not None and self._gripper_index is not None:
             lo, hi = self._gripper_qpos_range
@@ -112,6 +120,8 @@ class SimRobot(Robot):
         Reverse of ``_cmd_to_mj_qpos``.  For the gripper joint the physical
         range is mapped back to [0, 1].
         """
+        if self._model_coordinate_adapter is not None:
+            return self._model_coordinate_adapter.model_position_to_public(mj)
         cmd = mj.copy()
         if self._gripper_qpos_range is not None and self._gripper_index is not None:
             lo, hi = self._gripper_qpos_range
@@ -128,18 +138,26 @@ class SimRobot(Robot):
         joints (e.g. the gripper joint lives outside the model), the extra
         entries are zero-padded.
         """
+        model_torques = self._compute_model_gravity_torques()
+        if self._model_coordinate_adapter is not None:
+            return self._model_coordinate_adapter.model_effort_to_public(model_torques)
         nq = min(self._n_dofs, self._model.nq)
-        mj_qpos = self._cmd_to_mj_qpos(self._qpos)
-        self._inv_data.qpos[:nq] = mj_qpos[:nq]
-        self._inv_data.qvel[:] = 0.0
-        self._inv_data.qacc[:] = 0.0
-        mujoco.mj_inverse(self._model, self._inv_data)
         torques = np.zeros(self._n_dofs)
-        torques[:nq] = self._inv_data.qfrc_inverse[:nq]
+        torques[:nq] = model_torques[:nq]
         # Zero out gripper torque (matching MotorChainRobot behaviour).
         if self._gripper_index is not None:
             torques[self._gripper_index] = 0.0
         return torques
+
+    def _compute_model_gravity_torques(self) -> np.ndarray:
+        """Return gravity inverse dynamics in native MuJoCo generalized coordinates."""
+        mj_qpos = self._cmd_to_mj_qpos(self._qpos)
+        self._inv_data.qpos[:] = 0.0
+        self._inv_data.qpos[: len(mj_qpos)] = mj_qpos
+        self._inv_data.qvel[:] = 0.0
+        self._inv_data.qacc[:] = 0.0
+        mujoco.mj_inverse(self._model, self._inv_data)
+        return self._inv_data.qfrc_inverse.copy()
 
     def _update_joint_state(self) -> None:
         """Recompute _joint_state and _last_motor_torques from current state."""
@@ -189,18 +207,31 @@ class SimRobot(Robot):
         while not self._stop_event.is_set():
             with self._lock:
                 if self._grav_comp_enabled:
-                    grav = self._compute_gravity_torques()
-                    grav[:nq_arm] *= self._gravity_comp_factor[:nq_arm]
-
                     self._data.qfrc_applied[:] = 0.0
-                    self._data.qfrc_applied[:nq_arm] = grav[:nq_arm]
+                    if self._model_coordinate_adapter is not None:
+                        model_grav = self._compute_model_gravity_torques()
+                        self._data.qfrc_applied[:] = self._model_coordinate_adapter.model_effort_with_public_factors(
+                            model_grav, self._gravity_comp_factor
+                        )
+                    else:
+                        grav = self._compute_gravity_torques()
+                        grav[:nq_arm] *= self._gravity_comp_factor[:nq_arm]
+                        self._data.qfrc_applied[:nq_arm] = grav[:nq_arm]
 
                     for _ in range(n_substeps):
                         mujoco.mj_step(self._model, self._data)
 
-                    raw = self._data.qpos[:nq].copy()
-                    self._qpos[:nq] = self._mj_to_cmd_qpos(raw)[:nq]
-                    self._qvel[:nq] = self._data.qvel[:nq]
+                    if self._model_coordinate_adapter is not None:
+                        self._qpos = self._model_coordinate_adapter.model_position_to_public(
+                            self._data.qpos.copy(), atol=1.0e-5
+                        )
+                        self._qvel = self._model_coordinate_adapter.model_velocity_to_public(
+                            self._data.qvel.copy(), atol=1.0e-5
+                        )
+                    else:
+                        raw = self._data.qpos[:nq].copy()
+                        self._qpos[:nq] = self._mj_to_cmd_qpos(raw)[:nq]
+                        self._qvel[:nq] = self._data.qvel[:nq]
 
                 self._update_joint_state()
             sleep_time = next_time - time.time()
@@ -258,9 +289,9 @@ class SimRobot(Robot):
             if self._physics_active:
                 self._grav_comp_enabled = False
             self._qpos = pos
-            n = min(len(pos), self._model.nq)
             mj_qpos = self._cmd_to_mj_qpos(pos)
-            self._data.qpos[:n] = mj_qpos[:n]
+            self._data.qpos[:] = 0.0
+            self._data.qpos[: len(mj_qpos)] = mj_qpos
             self._data.qvel[:] = 0.0
             mujoco.mj_forward(self._model, self._data)
             self._update_joint_state()
@@ -307,6 +338,9 @@ class SimRobot(Robot):
             "gripper_index": self._gripper_index,
             "sim": True,
             "gravity_comp_factor": self._gravity_comp_factor,
+            "model_coordinate_schema": (
+                self._model_coordinate_adapter.SCHEMA_VERSION if self._model_coordinate_adapter is not None else None
+            ),
         }
 
     def close(self) -> None:

@@ -1,0 +1,121 @@
+{
+  "assembly": "linear_4310_soft",
+  "generator_version": "yam-complete-model-generator/v1",
+  "model_effort_to_public": {
+    "joint1": {
+      "scale": 1.0,
+      "target": "joint1"
+    },
+    "joint2": {
+      "scale": 1.0,
+      "target": "joint2"
+    },
+    "joint3": {
+      "scale": 1.0,
+      "target": "joint3"
+    },
+    "joint4": {
+      "scale": 1.0,
+      "target": "joint4"
+    },
+    "joint5": {
+      "scale": 1.0,
+      "target": "joint5"
+    },
+    "joint6": {
+      "scale": -1.0,
+      "target": "joint6"
+    }
+  },
+  "model_joint_names": [
+    "joint1",
+    "joint2",
+    "joint3",
+    "joint4",
+    "joint5",
+    "joint6",
+    "joint7",
+    "joint8"
+  ],
+  "model_qpos": {
+    "joint1": {
+      "offset": 0.0,
+      "scale": 1.0,
+      "source": "joint1"
+    },
+    "joint2": {
+      "offset": 0.0,
+      "scale": 1.0,
+      "source": "joint2"
+    },
+    "joint3": {
+      "offset": 0.0,
+      "scale": 1.0,
+      "source": "joint3"
+    },
+    "joint4": {
+      "offset": 0.0,
+      "scale": 1.0,
+      "source": "joint4"
+    },
+    "joint5": {
+      "offset": 0.0,
+      "scale": 1.0,
+      "source": "joint5"
+    },
+    "joint6": {
+      "offset": 0.0,
+      "scale": -1.0,
+      "source": "joint6"
+    },
+    "joint7": {
+      "offset": 0.0,
+      "scale": -0.0475,
+      "source": "gripper"
+    },
+    "joint8": {
+      "offset": 0.0,
+      "scale": -0.0475,
+      "source": "gripper"
+    }
+  },
+  "model_xml": "linear_4310_soft.xml",
+  "named_frames": {
+    "yam_tool": {
+      "assemblies": "all",
+      "mjcf_site_name": "grasp_site",
+      "parent": "gripper",
+      "quaternion_wxyz": [
+        0.0,
+        1.0,
+        0.0,
+        0.0
+      ],
+      "translation_m": [
+        0.0,
+        0.0,
+        -0.1937
+      ]
+    }
+  },
+  "public_gripper": {
+    "closed": 0.0,
+    "open": 1.0
+  },
+  "public_names": [
+    "joint1",
+    "joint2",
+    "joint3",
+    "joint4",
+    "joint5",
+    "joint6",
+    "gripper"
+  ],
+  "schema_version": "yam-coordinate-map/v1",
+  "source": {
+    "config_schema": "yam-model/v1",
+    "config_sha256": "7bfe441cabd0e75d578f7ef590bbd5e549b96a154c9482a0a4c81dd682458a5c",
+    "urdf": "source/assemblies/linear_4310_soft/yam.urdf",
+    "urdf_sha256": "d2c14cfc95fa976b678dc25b180ecf67f007f29eeba7146dd573e8f34a13c6e3"
+  }
+}

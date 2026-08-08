@@ -4,6 +4,7 @@ from typing import List
 
 _ROBOT_MODELS_ROOT = os.path.dirname(os.path.abspath(__file__))
 _ARM_ROOT = os.path.join(_ROBOT_MODELS_ROOT, "arm")
+_ASSEMBLED_YAM_ROOT = os.path.join(_ROBOT_MODELS_ROOT, "assembled", "yam")
 _VERSION_DIR_RE = re.compile(r"^v(\d+)$")
 
 
@@ -55,6 +56,19 @@ def get_arm_xml_path(arm: str, version: int = 1) -> str:
             f"Available versions for {arm!r}: {available_arm_versions(arm)}"
         )
     return path
+
+
+def get_assembled_yam_paths(assembly: str) -> tuple[str, str]:
+    """Return the complete MJCF and coordinate metadata for one packaged YAM assembly."""
+    if not assembly or os.path.basename(assembly) != assembly:
+        raise ValueError(f"Invalid assembled YAM model name: {assembly!r}")
+    directory = os.path.join(_ASSEMBLED_YAM_ROOT, assembly)
+    xml_path = os.path.join(directory, f"{assembly}.xml")
+    interface_path = os.path.join(directory, "model_interface.json")
+    missing = [path for path in (xml_path, interface_path) if not os.path.isfile(path)]
+    if missing:
+        raise FileNotFoundError(f"Incomplete packaged YAM assembly {assembly!r}; missing: {missing}")
+    return xml_path, interface_path
 
 
 # Arm XML paths — deprecated v1 aliases, kept so downstream users of the public package keep
