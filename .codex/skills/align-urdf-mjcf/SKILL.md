@@ -1,13 +1,31 @@
 ---
 name: align-urdf-mjcf
-description: Align a MuJoCo MJCF robot model with a URDF source while preserving kinematics, geometry, masses, centers of mass, and inertia tensors. Use when comparing or synchronizing .urdf and .xml robot descriptions, aligning URDF link frames or mesh headings with world axes, changing a robot root or base orientation without moving downstream links unintentionally, fixing mesh paths or joint names, matching home-pose link frames and link lengths, converting URDF inertias to MuJoCo principal inertias, keeping an arm model at a specified DOF count without embedding gripper or tip bodies, or standardizing terminal mounts across linear, crank, flexible, no-gripper, and teaching-handle variants while preserving each end effector's physical placement.
+description: Align or generate a MuJoCo MJCF robot model from a URDF while preserving kinematics, geometry, masses, centers of mass, and inertia tensors. Use when comparing or synchronizing .urdf and .xml descriptions, converting a complete custom YAM assembly, aligning URDF link frames or mesh headings with world axes, changing a robot root or base orientation without moving descendants unintentionally, fixing mesh paths or joint names, matching home-pose frames and link lengths, converting URDF inertias to MuJoCo principal inertias, keeping an official arm model at a specified DOF count, or standardizing terminal mounts while preserving end-effector placement.
 ---
 
 # Align URDF and MJCF
 
 ## Goal
 
-Treat the URDF as the source of truth unless the user states otherwise. Produce the smallest MJCF change that makes the requested arm scope numerically equivalent at the home pose and remains compatible with the repository's model-composition code.
+Treat the URDF as the source of truth unless the user states otherwise. First identify whether the target is an official arm-only model or a complete custom assembly. Produce the smallest change that makes the selected scope numerically equivalent and preserves that route's runtime contract.
+
+## Resolve the Workspace and Model Route
+
+For the lab workspace, expect sibling repositories under `YAM_Deployment/`: `i2rt/` is the vendor fork and
+`yam-policy-deployment/` owns canonical custom assembly assets and generation. Discover repository/package roots
+at runtime; never persist a machine-specific absolute workspace path in URDF, YAML, MJCF, Python, or tests.
+
+Use exactly one route:
+
+- **Official stock route:** keep the six-joint arm MJCF arm-only and attach the selected external gripper with
+  the existing composition utility.
+- **YAM_Deployment complete-assembly route:** convert the selected complete URDF tree, including the gripper,
+  coupled jaws, fixed fixture, case, and phone bodies. Use only that URDF, its referenced meshes, and the
+  user-facing model YAML. Do not call `combine_arm_and_gripper_xml`, inject stock arm values, rewrite authored
+  signs or poses, or apply a heuristic repair.
+
+Keep report-only comparisons with stock assets separate from generation. A reported mismatch must not change
+the complete-model output
 
 ## Establish the Contract
 
@@ -21,7 +39,7 @@ Treat the URDF as the source of truth unless the user states otherwise. Produce 
 4. Preserve unrelated user changes and assets.
 5. Create a short, verifiable task plan before editing.
 
-For the YAM arm-only contract, retain exactly six arm joints named `joint1` through `joint6`. Keep the terminal body named `gripper` -- the end-effector mount, named after the URDF's `joint6` child link. Do not copy the URDF gripper mass, gripper geometry, or tip bodies into the arm MJCF.
+For the official YAM arm-only contract, retain exactly six arm joints named `joint1` through `joint6`. Keep `link6` as the end-effector mount body. Do not copy the URDF gripper mass, gripper geometry, or tip bodies into that arm MJCF. This exclusion does not apply to a declared complete-assembly route.
 
 ## Inventory the Models
 
@@ -70,7 +88,7 @@ Use these equivalences:
 
 Represent the base as an explicit MJCF body when it has mass or inertia. A worldbody geom alone cannot represent the URDF base dynamics.
 
-For an arm-only terminal mount:
+For an official arm-only terminal mount:
 
 - Give the mount body the URDF joint6 child-frame pose and joint6.
 - Use a tiny valid placeholder inertia only when MuJoCo requires it, for example mass `1e-6` and diagonal inertia `1e-9 1e-9 1e-9`.
@@ -151,7 +169,10 @@ world
 
 Place each joint at `pos="0 0 0"` inside its child body when the body's transform already represents the URDF joint origin. Copy joint type, axis, range, and name exactly. Keep actuator-force metadata only if the existing MJCF convention requires it.
 
-For YAM, expect six arm meshes: `base.stl` and `link1.stl` through `link5.stl`. Exclude `gripper.stl`, `tip_left.stl`, and `tip_right.stl` from the arm MJCF.
+For the official arm-only YAM, expect six arm meshes: `base.stl` and `link1.stl` through `link5.stl`. Exclude
+`gripper.stl`, `tip_left.stl`, and `tip_right.stl` from that arm MJCF. For a complete custom assembly, preserve
+every visual and collision element explicitly referenced by the selected URDF and preserve fixed descendants as
+named bodies without joints.
 
 ## Cover All YAM End-Effector Variants
 
@@ -230,6 +251,15 @@ Compile the MJCF with the repository's supported MuJoCo version. For the standal
 
 Then exercise the repository's arm/gripper composition function for every supported external gripper and compile every generated MJCF. Verify that the first six joints remain `joint1` through `joint6`. Do not infer robot-interface DOF count solely from MuJoCo `njnt`: some grippers add no MuJoCo joint, while coupled linear grippers may add two.
 
+For a YAM_Deployment complete assembly, do not apply the standalone arm-only counts. Instead:
+
+- require the exact link/joint topology declared by the model YAML;
+- preserve `joint1` through `joint8` for the current soft-finger assemblies;
+- compile the generated complete MJCF directly, without arm/gripper composition;
+- verify seven public coordinates map by name to eight model coordinates using generated metadata;
+- verify all URDF local/global transforms, geometry origins, masses, COMs, and reconstructed inertia tensors; and
+- verify required tool/camera sites and declared equality/contact sections.
+
 For a gripper-mount standardization:
 
 - Compile every target gripper standalone.
@@ -254,6 +284,7 @@ Lead with the achieved scope. Report:
 
 - Which files changed.
 - Whether the model remains arm-only and at the requested DOF count.
+- Which model route was used and, for a complete assembly, its public/model coordinate counts.
 - Whether terminal mount bodies are physical or placeholders.
 - Whether terminal mount configs were standardized and gripper-specific offsets moved into gripper XML roots.
 - Maximum pose, length, mass, COM, and inertia errors.
@@ -270,6 +301,9 @@ Lead with the achieved scope. Report:
 - Do not rotate an axis in world coordinates and write it as a local axis.
 - Do not omit base mass by leaving the base as a world geom.
 - Do not copy gripper or tip dynamics into an arm-only MJCF.
+- Do not remove gripper, fixture, case, phone, or tip bodies from a declared complete-assembly conversion.
+- Do not pass a complete custom assembly through stock arm/gripper composition.
+- Do not embed an absolute checkout path in generated assets or tests.
 - Do not replace a composition mount placeholder with a physical gripper body.
 - Do not let arm joint6 pose or axis vary by gripper when the physical arm mount is the same.
 - Do not move a gripper-specific offset into the XML root without updating every affected per-arm mount config.

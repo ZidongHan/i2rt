@@ -13,6 +13,15 @@ description: Build, review, or debug an Isaac Lab or other RL joint-action deplo
 4. Require an explicit mapping from training joint names to `[joint1, ..., joint6]` plus one normalized gripper coordinate when motorized. Never rely on coincidental array order.
 5. Define whether actions mean absolute position, position delta, or position-plus-velocity target. Reject ambiguous checkpoints.
 
+In the lab layout, `i2rt/` and `yam-policy-deployment/` are sibling repositories under `YAM_Deployment/`.
+Install both into the deployment environment as editable packages and use ordinary absolute Python imports.
+Never use filesystem-relative imports such as `from ../i2rt...`, add checkout paths to `sys.path`, or persist a
+machine-specific workspace path in source/configuration.
+
+For a custom soft-finger/iPhone assembly, require the exact custom `GripperType`, its generated complete MJCF,
+and its generated model-interface metadata. The official `LINEAR_4310` route remains the stock composed model.
+Reject a custom assembly type with a non-YAM arm or with missing/stale generated assets.
+
 ## Build One Explicit Adapter
 
 Implement these stages in order:
@@ -21,7 +30,9 @@ Implement these stages in order:
 2. Apply the checkpoint's observation normalization without changing units silently.
 3. Run inference with a measured timestamp.
 4. Convert action normalization to SI arm targets and normalized gripper target.
-5. Map joint names/order and verify exact six/seven-element shape.
+5. Map training names to the seven public coordinates explicitly. When a custom complete model participates in
+   inference, IK, or inverse dynamics, apply its generated named public/model mapping; do not infer model qpos
+   order from array length.
 6. Reject non-finite or stale state/action.
 7. Clip to a configured inner safety envelope, then limit position delta, velocity, acceleration, and jerk using measured elapsed time.
 8. Publish only the newest setpoint through a bounded latest-wins handoff.
@@ -58,8 +69,11 @@ DISABLED -> ALIGN/HOLD -> POLICY -> HOLD or GRAVITY_IDLE -> DISABLED
 ## Account for Loads and Perturbations
 
 - Model every persistent end-effector fixture before hardware deployment.
-- Treat `ee_mass` as replacing the entire gripper-body mass, not adding payload mass.
-- Do not use `ee_inertia` in v1.2.4 until its invalid `ipos` generation is fixed and compile-tested.
+- On the official stock-composition route, treat `ee_mass` as replacing the entire gripper-body mass, not adding
+  payload mass, and do not use `ee_inertia` in v1.2.4 until its invalid `ipos` generation is fixed and
+  compile-tested.
+- On a custom complete-assembly route, change the canonical complete URDF and regenerate. Do not layer
+  `ee_mass`/`ee_inertia` overrides or stock gripper inertials on top of it.
 - Represent held objects with validated payload/model variants or a deliberately conservative controller; this layer does not estimate payload from motor effort.
 - Do not claim disturbance rejection from gravity compensation. It computes static modeled gravity with zero velocity/acceleration and has no contact-wrench observer.
 - Bound actions and gains for the worst credible payload and external perturbation; monitor effort and temperature.
@@ -71,7 +85,9 @@ Use `SimRobot` to validate dimensions, mappings, clipping, finite checks, watchd
 ## Commission Progressively
 
 1. Unit-test name/order, action scaling, limiters, latest-wins behavior, and timeout transitions.
-2. Run the repository model/API suite with `ArmType.YAM` and the selected gripper.
+2. Run the repository model/API suite with `ArmType.YAM` and the selected gripper. For a custom assembly, compile
+   the selected complete MJCF directly and verify the seven-public/eight-model named mapping, including joint-6
+   and coupled-jaw signs.
 3. Replay recorded observations with injected NaN, stale timestamps, inference overruns, and dropped commands.
 4. Perform a motor-disabled output inspection if the hardware setup supports it.
 5. Validate a low-gain current-pose hold, then small joint motions without payload.

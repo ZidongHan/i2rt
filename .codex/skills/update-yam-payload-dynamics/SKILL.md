@@ -1,6 +1,6 @@
 ---
 name: update-yam-payload-dynamics
-description: Update, review, or validate the standard i2RT YAM end-effector, fixture, gripper, or payload mass properties used by URDF, runtime-composed MJCF, MuJoCo gravity compensation, simulation, and policy deployment. Use when adding a non-negligible fixture, changing gripper geometry or inertials, representing held objects, correcting mass/center-of-mass/inertia data, diagnosing gravity-compensation error, or keeping standard-YAM URDF and MJCF aligned. Exclude Big YAM and require measured physical properties rather than invented dynamics.
+description: Update, review, or validate standard i2RT YAM end-effector, fixture, gripper, or payload properties used by URDF, stock runtime-composed MJCF, custom complete MJCF, MuJoCo gravity compensation, simulation, and policy deployment. Use when adding a non-negligible fixture, changing gripper geometry or inertials, representing held objects, correcting mass, center of mass, or inertia, diagnosing gravity-compensation error, or keeping YAM models aligned. Exclude Big YAM and require measured properties or explicitly accepted engineering estimates with recorded provenance rather than invented dynamics.
 ---
 
 # Update Standard YAM Payload Dynamics
@@ -14,15 +14,30 @@ description: Update, review, or validate the standard i2RT YAM end-effector, fix
    - a persistent rigid fixture that always belongs in the robot model;
    - a selectable tool that needs explicit model variants; and
    - a transient grasped object whose pose/mass may change during a task.
-5. Require mass, COM location and frame, inertia tensor about the COM and its frame, and the rigid attachment transform. Stop and request missing physical data rather than estimating it from appearance.
+5. Require mass, COM location and frame, inertia tensor about the COM and its frame, and the rigid attachment
+   transform. Record whether each value is measured, CAD-derived, or an explicitly accepted uniform-density or
+   scaled-inertia estimate. Stop rather than inventing missing dynamics from appearance.
+
+For the lab workspace, expect `i2rt/` and `yam-policy-deployment/` as siblings under `YAM_Deployment/`. Resolve
+repository and package resources without storing the machine-specific workspace path in source models or code.
 
 ## Audit the Runtime Path
 
-Trace `get_yam_robot` -> `combine_arm_and_gripper_xml` -> `MuJoCoKDL` -> `MotorChainRobot._compute_gravity_compensation` -> MIT torque feedforward. Confirm which body actually receives the inertial and whether the change replaces or adds to existing gripper properties.
+Identify the model route before tracing runtime behavior:
+
+- For the official stock YAM route, trace `get_yam_robot` -> `combine_arm_and_gripper_xml` -> `MuJoCoKDL` ->
+  `MotorChainRobot._compute_gravity_compensation` -> MIT torque feedforward.
+- For a YAM_Deployment custom assembly, trace its custom `GripperType` -> generated complete MJCF and
+  model-interface metadata -> named public/model coordinate adapter -> `MuJoCoKDL` -> gravity compensation ->
+  MIT torque feedforward. This route must bypass `combine_arm_and_gripper_xml`.
+
+Confirm which body receives every inertial and whether each change replaces or adds to existing properties.
+
 
 Remember:
 
-- The arm MJCF is composed with an external gripper at runtime.
+- The official arm MJCF is composed with an external gripper at runtime; a custom complete assembly is not.
+
 - `last_joint_mount.yam` from every gripper YAML overwrites the arm terminal `pos`, `quat`, and joint axis.
 - `ee_mass` replaces the composed gripper-body mass; supply a combined total only when that representation is physically valid.
 - `ee_inertia` is broken in v1.2.4 because it writes unsupported MJCF attribute `ipos`; fix it to `pos`, validate input, and compile the generated model before allowing use.
@@ -46,7 +61,11 @@ For MJCF, write `<inertial pos="..." mass="..." quat="w x y z" diaginertia="..."
 ## Choose the Durable Representation
 
 - Put permanent arm-link fixtures in the authoritative URDF link with measured visual/collision/inertial data, then regenerate and align the arm MJCF.
-- Keep the six-joint YAM arm MJCF arm-only; do not copy gripper/finger/tool bodies into its terminal placeholder.
+- Keep the official six-joint YAM arm MJCF arm-only; do not copy gripper/finger/tool bodies into its terminal
+  placeholder.
+- For a custom complete assembly, put permanent gripper, finger, mount, case, and installed-phone properties in
+  its canonical complete URDF and regenerate the complete MJCF literally. Do not apply `ee_mass`, copy stock
+  inertials, or hand-edit the generated MJCF.
 - Put permanent gripper/tool hardware in the appropriate gripper/tool model and preserve one public gripper action.
 - Use explicit payload/tool variants when held-object dynamics are known and discrete.
 - Avoid a mass-only override for production when COM or inertia also changes materially.
@@ -69,6 +88,10 @@ For MJCF, write `<inertial pos="..." mass="..." quat="w x y z" diaginertia="..."
 5. Numerically compare old/new mass, COM, tensor, TCP transform, joint frames, and gravity torque over representative configurations.
 6. Check gravity torque against the relevant DAMIAO motor limits with conservative margin; do not rely only on the repository's broad threshold.
 7. Run the full sim suite, lint, and `git diff --check`.
+
+For a custom complete assembly, also verify that changing only an accepted URDF mass/tensor and regenerating
+changes the compiled model and representative gravity torques while leaving kinematics and named-coordinate
+mapping unchanged. Evaluate inverse dynamics at the current mapped jaw opening, not an implicit default pose.
 
 Use commands such as:
 

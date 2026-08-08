@@ -1,4 +1,4 @@
 interface:
   display_name: "Deploy YAM Joint Policy"
   short_description: "Deploy bounded RL joint actions to YAM"
-  default_prompt: "Use $deploy-yam-joint-policy to build a safe YAM joint-policy deployment adapter."
+  default_prompt: "Use $deploy-yam-joint-policy to build a bounded YAM policy adapter with explicit public and model coordinate mappings."

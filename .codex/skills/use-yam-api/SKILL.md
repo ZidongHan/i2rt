@@ -12,6 +12,18 @@ description: Use, extend, review, or debug the standard six-joint i2RT YAM Pytho
 3. Identify the selected gripper, real versus `sim=True`, and whether the task reads state, commands motion, changes models, or diagnoses CAN behavior.
 4. Read [the user guide](../../../docs/yam-api-guide.md). Read [the backend trace](../../../docs/yam-api-internals.md) whenever motor effect, timing, safety, faults, or implementation changes matter.
 
+In the lab workspace, the vendor fork is `YAM_Deployment/i2rt/` and deployment code is in the sibling
+`YAM_Deployment/yam-policy-deployment/`. Install the fork as an editable package and import `i2rt` normally.
+Never use a parent-directory Python import, append the checkout to `sys.path`, or persist the absolute checkout
+path in code, model configuration, or generated assets.
+
+Distinguish model construction routes:
+
+- Official grippers, including `LINEAR_4310`, retain the existing arm-plus-gripper composition route.
+- Planned soft-finger/iPhone custom gripper types resolve to a generated complete YAM assembly plus generated
+  model-interface metadata and bypass `combine_arm_and_gripper_xml`.
+
+Do not treat the planned custom enum/model route as available until its implementation phase and tests exist.
 ## Preserve the Coordinate Contract
 
 - Use action order `[joint1, ..., joint6]`, followed by one gripper coordinate only for a motorized gripper.
@@ -36,14 +48,17 @@ Use complete six- or seven-element command vectors. Copy `get_joint_pos()` befor
 
 For any command change, follow this exact chain:
 
-1. Locate the public method in `i2rt/robots/motor_chain_robot.py`.
-2. Check arm clipping and `JointMapper` gripper conversion.
-3. Check gravity, friction, and gripper-force modification in `MotorChainRobot.update()`.
-4. Check shared-command replacement and the two independent background threads.
-5. Check sign/offset conversion in `DMChainCanInterface._set_commands()`.
-6. Check field clipping, quantization, and packing in `DMSingleMotorCanInterface.set_control()`.
-7. Check SocketCAN retry/response-ID behavior and feedback decoding.
-8. State whether the API sends a DAMIAO frame immediately, changes a future repeated frame, reads cached state, or has no hardware effect.
+1. Trace `get_yam_robot()` and confirm whether the selected type uses stock composition or a custom complete
+   model and named coordinate adapter.
+2. Locate the public method in `i2rt/robots/motor_chain_robot.py`.
+3. Check arm clipping and `JointMapper` gripper conversion.
+4. Check gravity, friction, and gripper-force modification in `MotorChainRobot.update()`.
+5. Check shared-command replacement and the two independent background threads.
+6. Check sign/offset conversion in `DMChainCanInterface._set_commands()`.
+7. Check field clipping, quantization, and packing in `DMSingleMotorCanInterface.set_control()`.
+8. Check SocketCAN retry/response-ID behavior and feedback decoding.
+9. State whether the API sends a DAMIAO frame immediately, changes a future repeated frame, reads cached state,
+   or has no hardware effect.
 
 Do not describe this repository as flashing DAMIAO firmware. Normal control talks to existing motor firmware. `can_flash.py` flashes the teaching-handle encoder, not an arm motor.
 

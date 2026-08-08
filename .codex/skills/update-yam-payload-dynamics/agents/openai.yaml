@@ -1,4 +1,4 @@
 interface:
   display_name: "Update YAM Payload Dynamics"
   short_description: "Keep YAM models correct for payload changes"
-  default_prompt: "Use $update-yam-payload-dynamics to update and validate standard YAM fixture or payload dynamics."
+  default_prompt: "Use $update-yam-payload-dynamics to update and validate YAM fixture or payload dynamics for the correct model route."
