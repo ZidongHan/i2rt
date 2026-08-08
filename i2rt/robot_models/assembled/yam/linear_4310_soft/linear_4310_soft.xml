@@ -83,6 +83,7 @@
     <joint joint1="joint7" joint2="joint8" polycoef="0 1 0 0 0" />
   </equality>
   <contact>
+    <exclude body1="base" body2="link1" />
     <exclude body1="gripper" body2="tip_left" />
     <exclude body1="gripper" body2="tip_right" />
     <exclude body1="tip_left" body2="tip_right" />
