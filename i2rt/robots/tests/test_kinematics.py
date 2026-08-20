@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from i2rt.robots.kinematics import Kinematics
+from i2rt.robots.kinematics import IKDiagnosticOptions, Kinematics
 from i2rt.robots.utils import ArmType, GripperType, combine_arm_and_gripper_xml
 
 
@@ -43,3 +43,60 @@ def test_cycle(kinematics_yam: Kinematics) -> None:
         assert success, f"IK failed for target pose {pose}, init_q: {q_init_for_ik}"
         pose_reconstructed = kinematics_yam.fk(q_ik)
         np.testing.assert_allclose(pose, pose_reconstructed, atol=1e-4)
+
+
+def test_diagnostic_defaults_preserve_legacy_ik_solution() -> None:
+    combined_path = combine_arm_and_gripper_xml(ArmType.YAM, GripperType.NO_GRIPPER)
+    target_kinematics = Kinematics(combined_path, "grasp_site")
+    target = target_kinematics.fk(np.full(6, 0.2))
+    seed = np.full(6, 0.25)
+    legacy = Kinematics(combined_path, "grasp_site")
+    diagnostic = Kinematics(combined_path, "grasp_site")
+    success, solution = legacy.ik(target, "grasp_site", init_q=seed)
+    result = diagnostic.ik_with_diagnostics(target, "grasp_site", init_q=seed)
+    assert success is result.success is True
+    assert result.failure_reason == "converged"
+    assert result.limits_mode == "model_default"
+    np.testing.assert_array_equal(solution, np.asarray(result.solution))
+    assert result.position_residual_norm <= result.position_threshold
+    assert result.orientation_residual_norm <= result.orientation_threshold
+    assert result.iterations > 0
+
+
+@pytest.mark.parametrize(
+    "gripper",
+    (
+        GripperType.LINEAR_4310_SOFT,
+        GripperType.LINEAR_4310_SOFT_IPHONE_15_PRO,
+        GripperType.LINEAR_4310_SOFT_IPHONE_15_PRO_MAX,
+    ),
+)
+def test_diagnostics_cover_complete_custom_yam_models(gripper: GripperType) -> None:
+    model_path, _interface_path = gripper.get_complete_model_paths(ArmType.YAM)
+    kinematics = Kinematics(model_path, "grasp_site")
+    seed = kinematics._configuration.model.qpos0.copy()
+    target = kinematics.fk(seed)
+    result = kinematics.ik_with_diagnostics(target, "grasp_site", init_q=seed)
+    assert result.success
+    assert len(result.solution) == 8
+    assert result.jacobian_minimum_singular_value > 0.0
+    assert result.jacobian_condition_estimate is not None
+    assert result.minimum_joint_limit_margin is not None
+
+
+def test_diagnostic_failure_and_limit_ablation_are_explicit(kinematics_yam: Kinematics) -> None:
+    seed = np.zeros(6)
+    target = kinematics_yam.fk(seed)
+    target[0, 3] += 0.1
+    result = kinematics_yam.ik_with_diagnostics(
+        target,
+        "grasp_site",
+        init_q=seed,
+        options=IKDiagnosticOptions(max_iters=1, use_model_joint_limits=False),
+    )
+    assert result.success is False
+    assert result.failure_reason == "maximum_iterations"
+    assert result.iterations == 1
+    assert result.limits_mode == "disabled"
+    assert result.position_residual_norm > result.position_threshold
+    assert len(result.seed) == len(result.solution) == len(result.joint_delta) == 6

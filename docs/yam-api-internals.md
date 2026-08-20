@@ -392,6 +392,11 @@ the XML and therefore misses the schema error.
 These run only in the host process through Mink/MuJoCo. They do not read a motor or send a command. A caller must
 explicitly pass a validated IK result into a motion API, which then follows the command trace above.
 
+The lab-fork `Kinematics.ik_with_diagnostics(...)` follows the same numerical path but returns immutable causal
+evidence. `limits=None` means Mink's model configuration limit is active; `use_model_joint_limits=False` selects
+an explicit empty limit list and is recorded as `disabled`. It is a diagnostic ablation, not permission to issue
+an out-of-envelope result. Solver damping and frame-task Levenberg-Marquardt damping are recorded separately.
+
 ## 11. Maintenance and special DAMIAO commands
 
 These lower-level tools are not normal policy APIs, but they are the direct motor-firmware management surface in

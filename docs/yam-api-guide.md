@@ -361,6 +361,13 @@ Solves differential inverse kinematics with Mink. It returns `(success, q_soluti
 robot. Pass a nearby measured `init_q`, enforce the model's joint limits, validate convergence, collision, and
 action deltas, then send a separately rate-limited arm command while preserving the gripper coordinate.
 
+`limits=None` retains Mink's default `ConfigurationLimit`; pass an empty list only for an explicitly labelled
+diagnostic no-limit ablation. The lab fork also provides `Kinematics.ik_with_diagnostics(...)` with immutable
+`IKDiagnosticOptions` and `IKDiagnosticResult`. Its defaults are numerically aligned with `ik(...)`, while its
+result records convergence reason, iterations, residuals, seed/solution delta, Jacobian conditioning, joint-limit
+margin, solver damping, frame-task damping, costs, and limit mode. This method remains kinematics-only and does
+not relax command or hardware safety limits.
+
 ## 9. Simulation
 
 ```python
