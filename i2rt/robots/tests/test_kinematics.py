@@ -1,3 +1,4 @@
+import mink
 import numpy as np
 import pytest
 
@@ -100,3 +101,41 @@ def test_diagnostic_failure_and_limit_ablation_are_explicit(kinematics_yam: Kine
     assert result.limits_mode == "disabled"
     assert result.position_residual_norm > result.position_threshold
     assert len(result.seed) == len(result.solution) == len(result.joint_delta) == 6
+
+
+@pytest.mark.parametrize("limits", [None, []])
+def test_legacy_and_diagnostic_ownership_and_explicit_limits(kinematics_yam: Kinematics, limits: object) -> None:
+    seed = np.full(6, 0.25)
+    original = seed.copy()
+    target = kinematics_yam.fk(np.full(6, 0.2))
+    target[0, 3] += 0.3
+    success, live_solution = kinematics_yam.ik(target, "grasp_site", init_q=seed, limits=limits, max_iters=2)
+    snapshot = live_solution.copy()
+    result = kinematics_yam.ik_with_diagnostics(
+        target, "grasp_site", init_q=seed, limits=limits, options=IKDiagnosticOptions(max_iters=2)
+    )
+    assert success is result.success is False
+    np.testing.assert_array_equal(snapshot, result.solution)
+    np.testing.assert_array_equal(seed, original)
+    assert not np.shares_memory(live_solution, kinematics_yam._configuration.data.qpos)
+    kinematics_yam.fk(np.zeros(6))
+    np.testing.assert_array_equal(snapshot, live_solution)
+    np.testing.assert_array_equal(snapshot, result.solution)
+    assert result.limits_mode == ("model_default" if limits is None else "disabled")
+
+
+def test_solver_failure_preserves_distinct_public_contracts(
+    kinematics_yam: Kinematics, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = kinematics_yam.fk(np.zeros(6))
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise mink.NoSolutionFound("quadprog")
+
+    monkeypatch.setattr(mink, "solve_ik", fail)
+    with pytest.raises(mink.NoSolutionFound):
+        kinematics_yam.ik(target, "grasp_site")
+    diagnostic = kinematics_yam.ik_with_diagnostics(target, "grasp_site")
+    assert diagnostic.success is False
+    assert diagnostic.failure_reason == "qp_no_solution"
+    assert diagnostic.iterations == 0

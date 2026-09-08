@@ -1,6 +1,6 @@
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 import mink
 import mujoco
@@ -106,7 +106,42 @@ class Kinematics:
         assert site_name is not None, "site_name must be provided"
         return self._configuration.get_transform_frame_to_world(site_name, "site").as_matrix()
 
-    def ik(
+    @staticmethod
+    def _frame_task(
+        target: np.ndarray,
+        site_name: str,
+        position_cost: float = 1.0,
+        orientation_cost: float = 1.0,
+        lm_damping: float = 1.0,
+    ) -> mink.FrameTask:
+        task = mink.FrameTask(
+            frame_name=site_name,
+            frame_type="site",
+            position_cost=position_cost,
+            orientation_cost=orientation_cost,
+            lm_damping=lm_damping,
+        )
+        task.set_target(mink.SE3.from_matrix(target))
+        return task
+
+    def _ik_iterations(
+        self,
+        task: mink.FrameTask,
+        *,
+        dt: float,
+        solver: str,
+        damping: float,
+        limits: Optional[List[mink.Limit]],
+        max_iters: int,
+    ) -> Iterator[np.ndarray]:
+        """Shared numerical kernel; each public entry point owns termination/failure policy."""
+        tasks = [task]
+        for _ in range(max_iters):
+            velocity = mink.solve_ik(self._configuration, tasks, dt, solver, damping=damping, limits=limits)
+            self._configuration.integrate_inplace(velocity, dt)
+            yield task.compute_error(self._configuration)
+
+    def ik(  # noqa: PLR0917 - preserve the existing positional public API
         self,
         target_pose: np.ndarray,
         site_name: str,
@@ -141,24 +176,15 @@ class Kinematics:
         if init_q is not None:
             self._configuration.update(init_q)
 
-        end_effector_task = mink.FrameTask(
-            frame_name=site_name,
-            frame_type="site",
-            position_cost=1.0,
-            orientation_cost=1.0,
-            lm_damping=1.0,
-        )
-
-        end_effector_task.set_target(mink.SE3.from_matrix(target_pose))
-        tasks = [end_effector_task]
+        end_effector_task = self._frame_task(target_pose, site_name)
 
         start_time = time.time()  # Start timing
 
-        for j in range(max_iters):
-            vel = mink.solve_ik(self._configuration, tasks, dt, solver, damping=damping, limits=limits)
-            self._configuration.integrate_inplace(vel, dt)
-            err = end_effector_task.compute_error(self._configuration)
-
+        for j, err in enumerate(
+            self._ik_iterations(
+                end_effector_task, dt=dt, solver=solver, damping=damping, limits=limits, max_iters=max_iters
+            )
+        ):
             pos_achieved = np.linalg.norm(err[:3]) <= pos_threshold
             ori_achieved = np.linalg.norm(err[3:]) <= ori_threshold
             if pos_achieved and ori_achieved:
@@ -210,41 +236,34 @@ class Kinematics:
             effective_limits = limits
             limits_mode = "disabled" if len(limits) == 0 else "explicit"
 
-        end_effector_task = mink.FrameTask(
-            frame_name=site_name,
-            frame_type="site",
-            position_cost=options.position_cost,
-            orientation_cost=options.orientation_cost,
-            lm_damping=options.frame_task_lm_damping,
+        end_effector_task = self._frame_task(
+            target, site_name, options.position_cost, options.orientation_cost, options.frame_task_lm_damping
         )
-        end_effector_task.set_target(mink.SE3.from_matrix(target))
-        tasks = [end_effector_task]
         success = False
         failure_reason = "maximum_iterations"
         iterations = 0
-        for iteration in range(options.max_iters):
-            try:
-                velocity = mink.solve_ik(
-                    self._configuration,
-                    tasks,
-                    options.dt,
-                    options.solver,
+        try:
+            for iteration, error in enumerate(
+                self._ik_iterations(
+                    end_effector_task,
+                    dt=options.dt,
+                    solver=options.solver,
                     damping=options.damping,
                     limits=effective_limits,
-                )
-            except mink.NoSolutionFound:
-                failure_reason = "qp_no_solution"
-                break
-            self._configuration.integrate_inplace(velocity, options.dt)
-            iterations = iteration + 1
-            error = end_effector_task.compute_error(self._configuration)
-            if (
-                np.linalg.norm(error[:3]) <= options.pos_threshold
-                and np.linalg.norm(error[3:]) <= options.ori_threshold
+                    max_iters=options.max_iters,
+                ),
+                start=1,
             ):
-                success = True
-                failure_reason = "converged"
-                break
+                iterations = iteration
+                if (
+                    np.linalg.norm(error[:3]) <= options.pos_threshold
+                    and np.linalg.norm(error[3:]) <= options.ori_threshold
+                ):
+                    success = True
+                    failure_reason = "converged"
+                    break
+        except mink.NoSolutionFound:
+            failure_reason = "qp_no_solution"
 
         error = end_effector_task.compute_error(self._configuration)
         jacobian = end_effector_task.compute_jacobian(self._configuration)
