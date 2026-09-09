@@ -19,6 +19,12 @@ description: >-
 
 # Align URDF and MJCF
 
+This is the stock **arm-only** maintenance route. Do not run it on the lab's complete soft-finger/iPhone YAM
+assemblies. In a paired YAM Deployment workspace, use its
+[custom-model cookbook](../../../../yam-policy-deployment/docs/model-generation-and-deployment-runbook.md)
+and [generation skill](../../../../.agents/skills/generate-yam-models/SKILL.md) for those assemblies instead.
+Stock maintenance below remains usable in a standalone i2rt checkout.
+
 ## Goal
 
 Treat the URDF as the source of truth unless the user states otherwise. Produce the smallest MJCF change that makes the requested arm scope numerically equivalent at the home pose and remains compatible with the repository's model-composition code.

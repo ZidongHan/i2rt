@@ -1,11 +1,31 @@
 # Standard YAM API guide
 
-This guide explains the public Python surface for the **standard i2RT YAM** arm in repository release
-`v1.2.4` (`5d47b35`). It deliberately excludes other arm products and the Flow Base. The intended reader is a
-robotics or mechanical engineer who is comfortable with joint coordinates but may be new to Python.
+This guide explains the public Python surface for the **standard i2RT YAM** arm. Its stock behavior was originally
+reviewed at `v1.2.4` (`5d47b35`); the lab-fork complete-model extensions below were rechecked on 2026-09-08.
+Other arm products and Flow Base are excluded. Hardware examples describe API effects, not a qualified lab SOP.
+The intended reader understands joint coordinates but may be new to Python.
 
 For the implementation-level path from each call to a DAMIAO CAN frame, see
 [YAM API internals: user call to DAMIAO motor](yam-api-internals.md).
+
+## Lab-fork complete custom assemblies
+
+The implemented `LINEAR_4310_SOFT`, `LINEAR_4310_SOFT_IPHONE_15_PRO` and
+`LINEAR_4310_SOFT_IPHONE_15_PRO_MAX` gripper types select complete generated models under
+`i2rt/robot_models/assembled/yam/`, with named coordinate metadata. They require `ArmType.YAM`, bypass
+`combine_arm_and_gripper_xml`, and reject `ee_mass`/`ee_inertia` overrides. Stock `LINEAR_4310` remains composed.
+
+Custom public commands remain seven coordinates: six arm radians and normalized aperture. Their complete models
+have eight coordinates, including reversed model joint 6 and two mapped jaws. `ModelCoordinateAdapter` maps
+position, velocity and effort explicitly; raw motor endpoint calibration is a different mapping. Custom hardware
+commands retain the official arm's unexpanded physical limits, while simulation/IK uses mapped complete-model
+limits. Do not import the stock ±0.15-rad factory expansion into this custom physical route.
+
+In a paired YAM Deployment workspace, its [model cookbook](../../yam-policy-deployment/docs/model-generation-and-deployment-runbook.md)
+owns canonical URDF/YAML generation, and its [hardware reference](../../yam-policy-deployment/docs/hardware-reference.md)
+owns the unqualified commissioning boundary. The underlying vendor API being implemented does not mean the
+outer PocketNav or general policy hardware route is enabled. `SimRobot` is state/API simulation, not the outer
+stepped synthetic plant and not a motor model.
 
 ## 1. The control model in one page
 
@@ -19,7 +39,7 @@ The standard YAM has six revolute arm joints. A motorized gripper adds one contr
 The two gripper jaws do **not** create two independent user actions. The MuJoCo model may contain two coupled
 finger joints (`joint7` and `joint8`), but one motor and one normalized public coordinate drive them together.
 The repository tests this 6-versus-7 contract in
-[`test_robot_variants.py`](../i2rt/robots/tests/test_robot_variants.py#L74).
+[`test_robot_variants.py`](../i2rt/robots/tests/test_robot_variants.py).
 
 Use these units and meanings:
 
@@ -31,7 +51,7 @@ Use these units and meanings:
 
 The last coordinate returned by `get_joint_pos()` is therefore **not radians** when a gripper is present. The
 implementation maps it between `[0, 1]` and the calibrated raw motor-angle endpoints; see
-[`JointMapper`](../i2rt/robots/utils.py#L468).
+[`JointMapper`](../i2rt/robots/utils.py).
 
 At the motor, the DAMIAO MIT-mode command has the familiar form
 
@@ -97,11 +117,11 @@ finally:
     robot.close()
 ```
 
-`zero_gravity_mode=False` initializes the position target to the measured pose and applies the configured PD
-gains. `True` starts with zero position stiffness plus gravity feedforward and small per-joint damping. The name
+`zero_gravity_mode=False` installs a measured-position target and configured PD gains after the background
+server has started; this is not an externally verified startup hold barrier. `True` starts with zero position stiffness plus gravity feedforward and small per-joint damping. The name
 does not mean that gravity is disabled.
 
-Important parameters from [`get_yam_robot`](../i2rt/robots/get_robot.py#L133):
+Important parameters from [`get_yam_robot`](../i2rt/robots/get_robot.py):
 
 | Parameter | Meaning for the standard YAM |
 | --- | --- |
@@ -127,8 +147,8 @@ gripper with `ee_mass=0.200` makes gravity compensation believe the whole body w
 As of v1.2.4, do **not** pass `ee_inertia`: the composition code writes `ipos`, which MuJoCo 3.8 rejects as an
 unknown `<inertial>` attribute. The current XML-only unit test does not compile this override. Correct the code to
 write and validate `pos`, validate the ten-element input, and add a MuJoCo compilation test before using it.
-Relevant implementation: [`combine_arm_and_gripper_xml`](../i2rt/robots/utils.py#L311) and
-[`test_assembly.py`](../i2rt/robots/tests/test_assembly.py#L149).
+Relevant implementation: [`combine_arm_and_gripper_xml`](../i2rt/robots/utils.py) and
+[`test_assembly.py`](../i2rt/robots/tests/test_assembly.py).
 
 #### Gripper construction and calibration
 
@@ -445,11 +465,11 @@ A deployment boundary should perform, in order:
 
 ## 13. Source map
 
-- Public protocol: [`i2rt/robots/robot.py`](../i2rt/robots/robot.py#L18)
-- YAM factory and configuration assembly: [`i2rt/robots/get_robot.py`](../i2rt/robots/get_robot.py#L133)
-- Real robot behavior: [`i2rt/robots/motor_chain_robot.py`](../i2rt/robots/motor_chain_robot.py#L62)
-- Simulation behavior: [`i2rt/robots/sim_robot.py`](../i2rt/robots/sim_robot.py#L37)
-- YAM hardware parameters: [`i2rt/robots/config/yam.yml`](../i2rt/robots/config/yam.yml)
-- Gripper mapping/calibration/force limiting: [`i2rt/robots/utils.py`](../i2rt/robots/utils.py#L468)
-- Kinematics: [`i2rt/robots/kinematics.py`](../i2rt/robots/kinematics.py#L11)
-- Physical YAM properties: [`i2rt/robot_models/arm/yam/README.md`](../i2rt/robot_models/arm/yam/README.md)
+- Public protocol: [`i2rt/robots/robot.py`](../i2rt/robots/robot.py)
+- YAM factory and configuration assembly: [`i2rt/robots/get_robot.py`](../i2rt/robots/get_robot.py)
+- Real robot behavior: [`i2rt/robots/motor_chain_robot.py`](../i2rt/robots/motor_chain_robot.py)
+- Simulation behavior: [`i2rt/robots/sim_robot.py`](../i2rt/robots/sim_robot.py)
+- YAM hardware parameters: [`i2rt/robots/config/yam_v1.yml`](../i2rt/robots/config/yam_v1.yml)
+- Gripper mapping/calibration/force limiting: [`i2rt/robots/utils.py`](../i2rt/robots/utils.py)
+- Kinematics: [`i2rt/robots/kinematics.py`](../i2rt/robots/kinematics.py)
+- Physical YAM properties: [`i2rt/robot_models/arm/yam/v1/README.md`](../i2rt/robot_models/arm/yam/v1/README.md)

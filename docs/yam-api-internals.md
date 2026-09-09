@@ -1,7 +1,8 @@
 # Standard YAM API internals: user call to DAMIAO motor
 
-This document traces the standard six-joint YAM API in release `v1.2.4` (`5d47b35`) from the user-facing Python
-call to the DAMIAO motor firmware boundary and back. It excludes other arm products and mobile-base code.
+This document traces the standard six-joint YAM API from Python to DAMIAO and back. Stock behavior was originally
+reviewed at `v1.2.4` (`5d47b35`); complete-model routing and source links were refreshed for the lab fork on
+2026-09-08. It excludes other arm products and mobile-base code. No physical commissioning is implied.
 
 The code in this repository is the authority for the claims below. Where a behavior is only suggested by a name
 or comment, that uncertainty is stated explicitly.
@@ -20,7 +21,7 @@ with firmware already running inside each motor controller:
   registers such as timeout.
 
 The repository's actual firmware-flashing utility,
-[`i2rt/utils/can_flash.py`](../i2rt/utils/can_flash.py#L1), explicitly targets the teaching handle's `ioheart`
+[`i2rt/utils/can_flash.py`](../i2rt/utils/can_flash.py), explicitly targets the teaching handle's `ioheart`
 passive encoder, not a DAMIAO arm motor. The CAN-adapter guide also discusses flashing adapter firmware, which is
 again separate from the motor controller.
 
@@ -65,7 +66,7 @@ firmware.
 ## 3. Static YAM assembly
 
 The standard YAM hardware YAML supplies the six arm entries read by
-[`_load_arm_config`](../i2rt/robots/utils.py#L114):
+[`_load_arm_config`](../i2rt/robots/utils.py):
 
 | Public index | Joint | CAN ID | Motor type | Default `kp` | Default `kd` | Gravity multiplier |
 | ---: | --- | ---: | --- | ---: | ---: | ---: |
@@ -78,7 +79,7 @@ The standard YAM hardware YAML supplies the six arm entries read by
 
 All six configured directions are `+1`. A motorized gripper is appended at public index 6 and CAN ID `0x07`.
 Its type, gains, direction, raw limits, calibration requirement, mount, and force-limiter parameters come from
-the selected gripper YAML. See [`yam.yml`](../i2rt/robots/config/yam.yml) and, for the default gripper,
+the selected gripper YAML. See [`yam_v1.yml`](../i2rt/robots/config/yam_v1.yml) and, for the default gripper,
 [`linear_4310.yml`](../i2rt/robots/config/linear_4310.yml).
 
 The hardware has one controlled gripper motor. The combined MuJoCo model may have two equal-coupled jaw joints;
@@ -88,14 +89,16 @@ model `nq` is therefore not the CAN motor count.
 
 ### `get_yam_robot(...)`: startup sequence
 
-The real path in [`get_yam_robot`](../i2rt/robots/get_robot.py#L248) performs these operations:
+The real path in [`get_yam_robot`](../i2rt/robots/get_robot.py) performs these operations:
 
-1. Read `yam.yml` and the selected gripper YAML.
-2. Compose an arm-plus-gripper MJCF in `/tmp`. This is the inverse-dynamics model used for gravity compensation.
-3. Load the six arm joint limits from MJCF and expand each end by 0.15 rad.
+1. Read `yam_v1.yml` and the selected gripper YAML.
+2. On stock routes compose an arm-plus-gripper MJCF in `/tmp`; custom types load a complete packaged MJCF and
+   `ModelCoordinateAdapter` instead, rejecting inertial overrides. This model supplies gravity inverse dynamics.
+3. Stock routes expand the loaded arm limits by 0.15 rad. Custom real commands retain the official unexpanded
+   physical arm envelope; custom simulation/IK exposes the complete model's mapped limits.
 4. Build the ordered motor list, directions, gains, gravity-idle damping, friction values, and zero software offsets.
 5. Open `python-can` on SocketCAN at 1 Mbit/s through
-   [`CanInterface`](../i2rt/motor_drivers/can_interface.py#L10).
+   [`CanInterface`](../i2rt/motor_drivers/can_interface.py).
 6. Drain stale frames and enable every motor. `motor_on(...)` sends `FF FF FF FF FF FF FF FC` to the motor's
    arbitration ID, parses the response, clears any error with `... FB`, and retries enable until normal.
 7. Decode an initial position for every motor and initialize the absolute-position unwrap accumulator.
@@ -108,6 +111,11 @@ The real path in [`get_yam_robot`](../i2rt/robots/get_robot.py#L248) performs th
 12. If `zero_gravity_mode=False`, copy measured position into a first PD hold target.
 
 Construction can therefore enable and command physical motors before returning to the caller.
+
+For complete custom assemblies, gravity evaluation maps current public arm **and aperture** into eight model
+coordinates, computes inverse dynamics at zero velocity/acceleration, then maps model efforts back to the public
+coordinates. Joint-6 signs and both jaws come from metadata, not vector length. Raw motor calibration, gains and
+CAN signs remain separate hardware concerns. See [the custom-route scope](yam-api-guide.md#lab-fork-complete-custom-assemblies).
 
 ### The two control threads
 
@@ -135,7 +143,7 @@ inference queue is used, bound it and drop stale entries, as the `minimum_gello`
 ### Outbound MIT command
 
 For the normal YAM path, `ControlMode.MIT` adds no arbitration-ID offset, so a command to motor `n` uses standard
-CAN ID `n`. [`set_control`](../i2rt/motor_drivers/dm_driver.py#L229) clips and quantizes five fields using the
+CAN ID `n`. [`set_control`](../i2rt/motor_drivers/dm_driver.py) clips and quantizes five fields using the
 selected motor type's declared range:
 
 | Field | Width | DM4340 range | DM4310 range |
@@ -164,7 +172,7 @@ overflow but is not a robot-level safety limit.
 
 ### Send/reply transaction
 
-[`CanInterface._send_message_get_response`](../i2rt/motor_drivers/can_interface.py#L38) sends one frame and waits
+[`CanInterface._send_message_get_response`](../i2rt/motor_drivers/can_interface.py) sends one frame and waits
 up to 10 ms for a response. With the YAM's `ReceiveMode.p16`, motor `n` is expected to reply on CAN ID `n + 16`.
 An unexpected frame is consumed and the call retries; normal control uses up to 15 attempts per motor. Exhaustion
 raises an assertion, which stops the motor communication thread.
@@ -174,7 +182,7 @@ next frame should be the corresponding reply.
 
 ### Inbound feedback
 
-[`parse_recv_message`](../i2rt/motor_drivers/dm_driver.py#L287) decodes:
+[`parse_recv_message`](../i2rt/motor_drivers/dm_driver.py) decodes:
 
 ```text
 byte 0 high nibble = error/status code
@@ -250,7 +258,7 @@ field.
 
 **Trace:**
 
-1. [`command_joint_pos`](../i2rt/robots/motor_chain_robot.py#L543) clips arm entries to the loaded limits.
+1. [`command_joint_pos`](../i2rt/robots/motor_chain_robot.py) clips arm entries to the loaded limits.
 2. `JointMapper.to_robot_joint_pos_space` changes the gripper from normalized `[0, 1]` into calibrated raw motor
    angle. Arm entries pass through.
 3. It clears torque/velocity fields, writes the mapped position, and copies configured `kp`/`kd` into
@@ -308,7 +316,7 @@ It adds host-side interpolation but no additional DAMIAO mode or trajectory prim
 
 ### Gravity compensation inside every real command
 
-[`MuJoCoKDL.compute_inverse_dynamics`](../i2rt/utils/mujoco_utils.py#L25) loads the runtime-composed model and calls
+[`MuJoCoKDL.compute_inverse_dynamics`](../i2rt/utils/mujoco_utils.py) loads the runtime-composed model and calls
 MuJoCo inverse dynamics using measured arm `q`, zero `qdot`, and zero `qddot`. The result is checked against a
 hardcoded 25 N·m maximum and multiplied by configured factors before entering the MIT torque field. The gripper
 gravity entry is explicitly zero.
@@ -354,7 +362,7 @@ After mapping, motor direction/offset are applied by the same chain path as the 
 
 ### Calibration
 
-[`detect_gripper_limits`](../i2rt/robots/utils.py#L682) calls `DMChainCanInterface.set_commands` with zero torque
+[`detect_gripper_limits`](../i2rt/robots/utils.py) calls `DMChainCanInterface.set_commands` with zero torque
 for all other motors and `+test_torque`, then `-test_torque`, for the gripper. The motor thread sends these values
 as MIT torque feedforward with zero position/velocity gains. Position is polled until three consecutive changes
 fall below the threshold or the direction times out. The observed minimum/maximum is ordered by configured motor
@@ -488,23 +496,23 @@ will receive the intended frame.
 
 | User API | Primary implementation | Last i2RT step before DAMIAO | Motor effect |
 | --- | --- | --- | --- |
-| `get_yam_robot` | [`get_robot.py`](../i2rt/robots/get_robot.py#L133) | `motor_on`, then start MIT loop | Enables all configured controllers and starts repeated commands. |
-| `num_dofs` | [`motor_chain_robot.py`](../i2rt/robots/motor_chain_robot.py#L503) | None | None. |
-| `get_joint_pos` | [`motor_chain_robot.py`](../i2rt/robots/motor_chain_robot.py#L515) | Read cached decoded reply | None. |
-| `get_observations` | [`motor_chain_robot.py`](../i2rt/robots/motor_chain_robot.py#L580) | Read cached decoded reply | None. |
+| `get_yam_robot` | [`get_robot.py`](../i2rt/robots/get_robot.py) | `motor_on`, then start MIT loop | Enables all configured controllers and starts repeated commands. |
+| `num_dofs` | [`motor_chain_robot.py`](../i2rt/robots/motor_chain_robot.py) | None | None. |
+| `get_joint_pos` | [`motor_chain_robot.py`](../i2rt/robots/motor_chain_robot.py) | Read cached decoded reply | None. |
+| `get_observations` | [`motor_chain_robot.py`](../i2rt/robots/motor_chain_robot.py) | Read cached decoded reply | None. |
 | `get_joint_state` | Protocol stub | None | None; returns `None` on real YAM. |
 | `get_robot_info` / specs | Local metadata | None | None. |
 | `get_motor_torques` | Local cached outbound value | None | None until regular loop sends it. |
-| `command_joint_pos` | [`motor_chain_robot.py`](../i2rt/robots/motor_chain_robot.py#L543) | `DMSingleMotorCanInterface.set_control` | MIT `q`, zero `qd`, configured gains, gravity/friction torque FF. |
-| `command_joint_state` | [`motor_chain_robot.py`](../i2rt/robots/motor_chain_robot.py#L556) | `set_control` | MIT `q`, `qd`, chosen gains, gravity/friction torque FF. |
+| `command_joint_pos` | [`motor_chain_robot.py`](../i2rt/robots/motor_chain_robot.py) | `DMSingleMotorCanInterface.set_control` | MIT `q`, zero `qd`, configured gains, gravity/friction torque FF. |
+| `command_joint_state` | [`motor_chain_robot.py`](../i2rt/robots/motor_chain_robot.py) | `set_control` | MIT `q`, `qd`, chosen gains, gravity/friction torque FF. |
 | `command_target_vel` | Protocol stub | None | None on real YAM. |
-| `move_joints` | [`motor_chain_robot.py`](../i2rt/robots/motor_chain_robot.py#L615) | Repeated position path | Sequence of MIT position setpoints. |
-| `enter_gravity_comp_idle` | [`motor_chain_robot.py`](../i2rt/robots/motor_chain_robot.py#L640) | `set_control` | MIT zero stiffness, small damping, gravity FF. |
-| `update_kp_kd` | [`motor_chain_robot.py`](../i2rt/robots/motor_chain_robot.py#L635) | Next position command | Changes future MIT gains. |
-| `zero_torque_mode` | [`motor_chain_robot.py`](../i2rt/robots/motor_chain_robot.py#L573) | `set_control` | MIT zero PD but gravity/friction can remain. |
-| `combine_arm_and_gripper_xml` | [`robots/utils.py`](../i2rt/robots/utils.py#L181) | Gravity model | Indirectly changes future MIT gravity torque. |
-| `Kinematics.fk/ik` | [`kinematics.py`](../i2rt/robots/kinematics.py#L11) | None | None until caller sends result. |
-| `close` | [`motor_chain_robot.py`](../i2rt/robots/motor_chain_robot.py#L627) | Close CAN bus | Stops host frames; no motor-off command. |
+| `move_joints` | [`motor_chain_robot.py`](../i2rt/robots/motor_chain_robot.py) | Repeated position path | Sequence of MIT position setpoints. |
+| `enter_gravity_comp_idle` | [`motor_chain_robot.py`](../i2rt/robots/motor_chain_robot.py) | `set_control` | MIT zero stiffness, small damping, gravity FF. |
+| `update_kp_kd` | [`motor_chain_robot.py`](../i2rt/robots/motor_chain_robot.py) | Next position command | Changes future MIT gains. |
+| `zero_torque_mode` | [`motor_chain_robot.py`](../i2rt/robots/motor_chain_robot.py) | `set_control` | MIT zero PD but gravity/friction can remain. |
+| `combine_arm_and_gripper_xml` | [`robots/utils.py`](../i2rt/robots/utils.py) | Gravity model | Indirectly changes future MIT gravity torque. |
+| `Kinematics.fk/ik` | [`kinematics.py`](../i2rt/robots/kinematics.py) | None | None until caller sends result. |
+| `close` | [`motor_chain_robot.py`](../i2rt/robots/motor_chain_robot.py) | Close CAN bus | Stops host frames; no motor-off command. |
 
 ## 15. Confirmed gaps relevant to policy deployment
 
