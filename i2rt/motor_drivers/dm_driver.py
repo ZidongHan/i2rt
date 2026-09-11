@@ -195,7 +195,7 @@ class DMSingleMotorCanInterface(CanInterface):
         """
         id = self._get_frame_id(motor_id)
         data = [0xFF] * 7 + [0xFD]
-        message = self._send_message_get_response(id, motor_id, data)
+        message = self._send_message_get_response(id, motor_id, data, bypass_command_guard=True)
         return self.parse_recv_message(message, motor_type, ignore_error=True)
 
     def save_zero_position(self, motor_id: int) -> None:
@@ -446,6 +446,8 @@ class DMChainCanInterface(MotorChain):
         self.state = None
         self.running = False
         self.command_lock = threading.RLock()
+        self.transport_lock = threading.Lock()
+        self._sender_fault: Optional[str] = None
         self._receive_sequence = 0
         self._sweep_id = 0
         self._sweep_started_monotonic = 0.0
@@ -453,6 +455,10 @@ class DMChainCanInterface(MotorChain):
         self._command_id = 0
         self._feedback_command_id = 0
         self._command_valid_until = None  # legacy callers retain their existing refresh contract
+        if guarded_startup:
+            # A bounded individual exchange is also used during enable/discovery.
+            # Qualified installations can choose a stricter timeout before use.
+            self.motor_interface.transaction_timeout_s = 0.02
         self.state_lock = threading.Lock()
         self._report_interval = report_interval
         self._rate_recorder = RateRecorder(name=self, report_interval=report_interval)
@@ -488,6 +494,8 @@ class DMChainCanInterface(MotorChain):
         self.command_lock = threading.RLock()
 
         self.start_thread_flag = False
+        if guarded_startup:
+            self.motor_interface.command_permitted = lambda: self.running
         if start_thread:
             self.start_thread()
 
@@ -562,10 +570,16 @@ class DMChainCanInterface(MotorChain):
     def start_thread(self) -> None:
         if self.start_thread_flag:
             return
+        if self._guarded_startup and (
+            not self.running or self._command_valid_until is None or time.monotonic() >= self._command_valid_until
+        ):
+            raise RuntimeError("guarded sender requires an installed, unexpired complete native command")
         logging.info("starting separate thread for control loop")
         self._sender_thread = threading.Thread(target=self._set_torques_and_update_state)
         self._sender_thread.start()
         self.start_thread_flag = True
+        if self._guarded_startup:
+            return
         time.sleep(0.1)
         while self.state is None:
             time.sleep(0.1)
@@ -609,33 +623,39 @@ class DMChainCanInterface(MotorChain):
                         report_start_time = curr_time
 
                     # Update state
-                    with self.command_lock:
-                        try:
+                    try:
+                        with self.command_lock:
                             if self._command_valid_until is not None and time.monotonic() >= self._command_valid_until:
                                 raise RuntimeError("native command producer expired; stopping CAN refresh")
-                            sweep_started = time.monotonic()
+                            commands = tuple(self.commands)
                             command_id = self._command_id
-                            motor_feedback = self._set_commands(self.commands)
-                        except RuntimeError as e:
-                            if self.enable_auto_recovery and "Motor error detected" in str(e):
-                                logging.warning(f"Motor error in control loop, attempting recovery: {e}")
-                                if self._try_recover_motors():
-                                    logging.warning("Motor recovery successful, continuing control loop")
-                                    continue
-                                self.running = False
-                                raise
-                            raise
-
-                        errors = np.array([motor_feedback[i].error_code != "0x1" for i in range(len(motor_feedback))])
-                        if np.any(errors):
-                            if self.enable_auto_recovery:
-                                logging.warning(f"Motor errors detected in feedback: {errors}, attempting recovery")
-                                if self._try_recover_motors(motor_feedback):
-                                    logging.warning("Motor recovery successful, continuing control loop")
-                                    continue
+                            original_expiry = self._command_valid_until
+                        sweep_started = time.monotonic()
+                        # Publication and urgent flags never wait for CAN I/O.
+                        # The transport lock only serializes physical exchanges
+                        # against explicit motor-disable/initial acquisition.
+                        with self.transport_lock:
+                            motor_feedback = self._set_commands(commands, valid_until=original_expiry)
+                    except RuntimeError as e:
+                        if self.enable_auto_recovery and "Motor error detected" in str(e):
+                            logging.warning(f"Motor error in control loop, attempting recovery: {e}")
+                            if self._try_recover_motors():
+                                logging.warning("Motor recovery successful, continuing control loop")
+                                continue
                             self.running = False
-                            logging.error(f"motor errors: {errors}")
-                            raise Exception(f"motor errors detected: {errors}, stopping control loop")
+                            raise
+                        raise
+
+                    errors = np.array([motor_feedback[i].error_code != "0x1" for i in range(len(motor_feedback))])
+                    if np.any(errors):
+                        if self.enable_auto_recovery:
+                            logging.warning(f"Motor errors detected in feedback: {errors}, attempting recovery")
+                            if self._try_recover_motors(motor_feedback):
+                                logging.warning("Motor recovery successful, continuing control loop")
+                                continue
+                        self.running = False
+                        logging.error(f"motor errors: {errors}")
+                        raise Exception(f"motor errors detected: {errors}, stopping control loop")
 
                     with self.state_lock:
                         self.state = motor_feedback
@@ -654,6 +674,9 @@ class DMChainCanInterface(MotorChain):
                 except Exception as e:
                     print(f"DM Error in control loop: {e}")
                     self.running = False
+                    self._sender_fault = str(e)
+                    if self._guarded_startup:
+                        return
                     raise e
 
     def _try_recover_motors(self, motor_feedback: Optional[List[MotorInfo]] = None, max_retries: int = 3) -> bool:
@@ -700,10 +723,15 @@ class DMChainCanInterface(MotorChain):
 
         return False
 
-    def _set_commands(self, commands: List[MotorCmd]) -> List[MotorInfo]:
+    def _set_commands(self, commands: List[MotorCmd], *, valid_until: Optional[float] = None) -> List[MotorInfo]:
         motor_feedback = []
+        original_expiry = self._command_valid_until if valid_until is None else valid_until
+        if getattr(self, "_guarded_startup", False):
+            self.motor_interface.command_deadline = original_expiry
         for idx, motor_info in enumerate(self.motor_list):
-            if self._command_valid_until is not None and time.monotonic() >= self._command_valid_until:
+            if getattr(self, "_guarded_startup", False) and not self.running:
+                raise RuntimeError("guarded sender stopped before next motor transaction")
+            if original_expiry is not None and time.monotonic() >= original_expiry:
                 raise RuntimeError("native command expired during CAN sweep")
             motor_id, motor_type = motor_info
             torque = commands[idx].torque * self.motor_direction[idx]
@@ -730,6 +758,43 @@ class DMChainCanInterface(MotorChain):
             self._receive_sequence += 1
             fd_back.receive_sequence = self._receive_sequence
         return motor_feedback
+
+    @property
+    def requires_staged_start(self) -> bool:
+        return self._guarded_startup and not self.start_thread_flag
+
+    def acquire_startup_feedback(self, *, maximum_duration_s: float = 0.05) -> List[MotorInfo]:
+        """One explicit zero-effort sweep while the operator supports the arm.
+
+        No background producer is started, no fault is cleared/re-enabled, and
+        these probes cannot overwrite an installed reference or run after disable.
+        """
+        if not self.requires_staged_start or not self.running or self._command_valid_until is not None:
+            raise RuntimeError("startup feedback acquisition is no longer permitted")
+        if not np.isfinite(maximum_duration_s) or maximum_duration_s <= 0:
+            raise ValueError("startup feedback needs a positive finite duration")
+        started = time.monotonic()
+        deadline = started + maximum_duration_s
+        if not self.transport_lock.acquire(timeout=maximum_duration_s):
+            raise TimeoutError("startup feedback transport busy")
+        try:
+            frames = self._set_commands([MotorCmd(torque=0.0) for _ in self.motor_list], valid_until=deadline)
+            if any(frame.error_code != "0x1" for frame in frames):
+                raise RuntimeError("startup feedback reports disabled/faulted motor")
+            with self.state_lock:
+                self.state = frames
+                self._update_absolute_positions(frames)
+                self._sweep_id += 1
+                self._sweep_started_monotonic = started
+                self._sweep_completed_monotonic = time.monotonic()
+                self._feedback_command_id = 0
+            return self.read_states()
+        except Exception as error:
+            self.running = False
+            self._sender_fault = str(error)
+            raise
+        finally:
+            self.transport_lock.release()
 
     def read_states(self, torques: Optional[np.ndarray] = None) -> List[MotorInfo]:
         motor_infos = []
@@ -787,6 +852,10 @@ class DMChainCanInterface(MotorChain):
                 )
             )
         with self.command_lock:
+            if getattr(self, "_guarded_startup", False) and not self.running:
+                raise RuntimeError("stopped guarded sender cannot accept commands")
+            if getattr(self, "_guarded_startup", False) and valid_until is None:
+                raise ValueError("guarded native commands require an original finite expiry")
             if self._command_valid_until is not None and time.monotonic() >= self._command_valid_until:
                 self.running = False
                 raise RuntimeError("expired native producer cannot renew CAN refresh")
@@ -804,6 +873,9 @@ class DMChainCanInterface(MotorChain):
 
     def close(self) -> None:
         self.running = False
+        sender = getattr(self, "_sender_thread", None)
+        if sender is not None and sender is not threading.current_thread():
+            sender.join(timeout=0.1)
         self.motor_interface.close()
 
     def disable_motors(self) -> list[dict]:
@@ -814,7 +886,8 @@ class DMChainCanInterface(MotorChain):
         """
         self.running = False
         results = []
-        acquired = self.command_lock.acquire(timeout=0.1)
+        lock = getattr(self, "transport_lock", self.command_lock)
+        acquired = lock.acquire(timeout=0.1)
         try:
             for motor_id, motor_type in self.motor_list:
                 outcome = {"motor_id": motor_id, "attempted": False, "confirmed": False}
@@ -831,7 +904,7 @@ class DMChainCanInterface(MotorChain):
                 results.append(outcome)
         finally:
             if acquired:
-                self.command_lock.release()
+                lock.release()
         return results
 
 

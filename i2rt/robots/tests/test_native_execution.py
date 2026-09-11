@@ -2,6 +2,7 @@
 
 import time
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -81,6 +82,60 @@ def test_staged_native_does_not_publish_and_requires_initial_reference() -> None
     finally:
         robot.close()
     assert not chain.disabled  # close is not motor disable
+
+
+def test_guarded_sender_starts_only_after_complete_native_command_is_installed() -> None:
+    robot, chain = robot_fixture()
+    chain.requires_staged_start = True
+    order = []
+
+    def start_sender() -> None:
+        assert chain.commands
+        ff, command = chain.commands[-1]
+        np.testing.assert_array_equal(ff, 0)
+        np.testing.assert_allclose(command["pos"], [0, 0, 0, 0, 0, 0, -1])
+        np.testing.assert_array_equal(command["kp"], robot._kp)
+        assert command["valid_until"] > time.monotonic()
+        order.append("sender")
+
+    chain.start_thread = start_sender
+    # Exercise start ordering without launching another test background thread.
+    robot._server_thread = type("NativeThread", (), {"start": lambda _: order.append("native")})()
+    try:
+        robot.command_joint_reference(stationary_packet())
+        robot.start_execution()
+        assert order == ["sender", "native"]
+    finally:
+        robot._execution_started = False
+        robot.close()
+
+
+def test_limiter_release_occurs_at_native_reference_activation_not_publication() -> None:
+    robot, chain = robot_fixture()
+    calls = []
+    limiter = SimpleNamespace(release_pending=True, defer_release=True, _is_clogged=True)
+
+    def acknowledge() -> None:
+        calls.append(time.monotonic())
+        limiter.release_pending = False
+
+    limiter.acknowledge_release = acknowledge
+    robot._gripper_force_limiter = limiter
+    try:
+        robot.command_joint_reference(stationary_packet(horizon=1))
+        origin = time.monotonic() + 0.015
+        proposal = replace(stationary_packet(2), origin=origin, brake_at=origin + 0.02, release_gripper=True)
+        robot.command_joint_reference(proposal)
+        robot.update()
+        assert not calls
+        time.sleep(0.02)
+        chain.states = [replace(m, received_monotonic=time.monotonic()) for m in chain.states]
+        robot.update()
+        assert len(calls) == 1 and calls[0] >= origin
+        robot.update()
+        assert len(calls) == 1
+    finally:
+        robot.close()
 
 
 def test_native_reference_maps_raw_jaw_and_sets_sender_expiry() -> None:

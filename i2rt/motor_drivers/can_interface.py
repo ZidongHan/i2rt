@@ -36,7 +36,14 @@ class CanInterface:
         self.bus.shutdown()
 
     def _send_message_get_response(
-        self, id: int, motor_id: int, data: List[int], max_retry: int = 5, expected_id: Optional[int] = None
+        self,
+        id: int,
+        motor_id: int,
+        data: List[int],
+        max_retry: int = 5,
+        expected_id: Optional[int] = None,
+        *,
+        bypass_command_guard: bool = False,
     ) -> can.Message:
         """Send a message over the CAN bus.
 
@@ -48,18 +55,41 @@ class CanInterface:
             can.Message: The message that was sent.
         """
         message = can.Message(arbitration_id=id, data=data, is_extended_id=False)
+        budget = getattr(self, "transaction_timeout_s", None)
+        deadline = None if budget is None else time.monotonic() + budget
+        original_expiry = None if bypass_command_guard else getattr(self, "command_deadline", None)
+        if original_expiry is not None:
+            deadline = original_expiry if deadline is None else min(deadline, original_expiry)
         for _ in range(max_retry):
+            if not bypass_command_guard:
+                permitted = getattr(self, "command_permitted", None)
+                if permitted is not None and not permitted():
+                    raise RuntimeError("guarded transport authority stopped")
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError("guarded CAN transaction exceeded original deadline")
             try:
                 # logging.info("Sending message: %s at %f", message, time.time())
-                self.bus.send(message)
-                response = self._receive_message(motor_id, timeout=0.01)
+                if remaining is None:
+                    self.bus.send(message)
+                else:
+                    self.bus.send(message, timeout=remaining)
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    raise TimeoutError("guarded CAN send exceeded original deadline")
+                response = self._receive_message(motor_id, timeout=0.01 if remaining is None else min(0.01, remaining))
+                if deadline is not None and time.monotonic() > deadline:
+                    raise TimeoutError("guarded CAN reply exceeded original deadline")
                 # logging.info("Received response: %s at %f", response, time.time())
 
                 if expected_id is None:
                     expected_id = self.receive_mode.get_receive_id(motor_id)
                 if response and (expected_id == response.arbitration_id):
                     return response
-                self.try_receive_message(id)
+                if deadline is None:
+                    self.try_receive_message(id)
+                elif time.monotonic() < deadline:
+                    self.try_receive_message(id, timeout=min(0.009, deadline - time.monotonic()))
             except (can.CanError, AssertionError) as e:
                 logging.warning(e)
                 logging.warning(
@@ -97,8 +127,8 @@ class CanInterface:
         """
         drained = 0
         idle = 0
-        deadline = time.time() + timeout_s
-        while time.time() < deadline and idle < idle_count:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline and idle < idle_count:
             if self.try_receive_message(timeout=0.001) is None:
                 idle += 1
             else:
@@ -120,12 +150,13 @@ class CanInterface:
         Raises:
             AssertionError: If no message is received within the timeout.
         """
-        start_time = time.time()
-        while (time.time() - start_time) < timeout:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            remaining = min(0.001, max(0.0, deadline - time.monotonic()))
             if self.use_buffered_reader:
-                message = self.buffered_reader.get_message(timeout=0.001)
+                message = self.buffered_reader.get_message(timeout=remaining)
             else:
-                message = self.bus.recv(timeout=0.001)
+                message = self.bus.recv(timeout=remaining)
             if message:
                 return message
         if not supress_warning:

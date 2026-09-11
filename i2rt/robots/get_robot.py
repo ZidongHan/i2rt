@@ -278,10 +278,11 @@ def create_yam_motor_chain(
     enable_auto_recovery: bool = False,
     guarded_startup: bool = True,
 ) -> DMChainCanInterface:
-    """ACTIVE hardware operation: enable/discover motors and start CAN refresh.
+    """ACTIVE hardware operation: enable/discover the configured motors.
 
     The caller must authorize/support the arm before this function. Guarded
-    startup never clears faults; native staged construction is a separate step.
+    Startup never clears faults. Guarded mode leaves the sender stopped until
+    the native controller has installed an admitted complete initial reference.
     """
     # Single pass: create chain, read positions, fix wrap-around offsets in-place, then start thread.
     motor_chain = DMChainCanInterface(
@@ -312,7 +313,8 @@ def create_yam_motor_chain(
     logging.info(f"adjusted motor_offsets: {motor_chain.motor_offset.tolist()}")
 
     # Start the control thread with corrected offsets.
-    motor_chain.start_thread()
+    if not guarded_startup:
+        motor_chain.start_thread()
     logging.info(f"YAM initial motor_states: {motor_chain.read_states()}")
 
     return motor_chain

@@ -245,6 +245,7 @@ class MotorChainRobot(Robot):
         self._pending_reference: Optional[Tuple[AdmittedReference, bool]] = None
         self._reference_gravity_idle = False
         self._reference_braking_sequence = -1
+        self._gripper_release_sequence = -1
         self._native_fault: Optional[str] = None
         self._native_update_generation = 0
         self._native_update_monotonic = 0.0
@@ -261,7 +262,8 @@ class MotorChainRobot(Robot):
         self._joint_state: Optional[JointStates] = None
         while self._joint_state is None:
             # wait to recive joint data
-            time.sleep(0.05)
+            if start_server_thread:
+                time.sleep(0.05)
             self._joint_state = self._motor_state_to_joint_state(self.motor_chain.read_states())
         if self._gripper_index is not None:
             self._last_gripper_command_qpos = self.remapper.to_robot_joint_pos_space(self._joint_state.pos)[
@@ -293,6 +295,11 @@ class MotorChainRobot(Robot):
         if not self._execution_started:
             if self._reference is None:
                 raise RuntimeError("staged execution requires an admitted startup reference")
+            if getattr(self.motor_chain, "requires_staged_start", False):
+                # Install all gains, mapped q/qd and native FF before any CAN
+                # repeater starts. Startup observations came from bounded probes.
+                self.update()
+                self.motor_chain.start_thread()
             self._server_thread.start()
             self._execution_started = True
 
@@ -342,12 +349,6 @@ class MotorChainRobot(Robot):
             ),
             "gripper_limited": bool(self._gripper_force_limiter and self._gripper_force_limiter._is_clogged),
         }
-
-    def acknowledge_gripper_release(self) -> None:
-        """Call after committing a bounded scalar replan from current jaw feedback."""
-        with self._state_lock:
-            if self._gripper_force_limiter is not None:
-                self._gripper_force_limiter.acknowledge_release()
 
     def request_controlled_braking(self) -> Optional[AdmittedReference]:
         """Cancel the next proposal; consume the active packet's admitted brake.
@@ -550,6 +551,20 @@ class MotorChainRobot(Robot):
                     self._reference_braking_sequence = reference.sequence
                 with self._state_lock:
                     self._joint_state = observed
+                    if (
+                        reference.release_gripper
+                        and now < reference.brake_at
+                        and self._gripper_release_sequence != reference.sequence
+                    ):
+                        if self._gripper_force_limiter is not None and self._gripper_force_limiter.release_pending:
+                            index = self._gripper_index
+                            if (
+                                abs(observed.pos[index] - q[index]) > reference.following_error[index]
+                                or abs(observed.vel[index] - qd[index]) > reference.following_velocity_error[index]
+                            ):
+                                raise RuntimeError("native jaw release continuation is outside measured corridor")
+                            self._gripper_force_limiter.acknowledge_release()
+                        self._gripper_release_sequence = reference.sequence
             except Exception as error:
                 self._native_fault = str(error)
                 self._stop_event.set()
@@ -597,7 +612,8 @@ class MotorChainRobot(Robot):
                     max(self._gripper_limits),
                 )
                 self._last_gripper_command_qpos = joint_commands.pos[self._gripper_index]
-            self._update_joint_state(motor_torques, joint_commands)
+            if not self._update_joint_state(motor_torques, joint_commands):
+                return
             self._native_update_generation += 1
             self._native_update_monotonic = time.monotonic()
             if reference is not None:
@@ -624,10 +640,10 @@ class MotorChainRobot(Robot):
         motor_torques: np.ndarray,
         joint_commands: "JointCommands",
         encoder_infos: Optional[List[PassiveEncoderInfo]] = None,
-    ) -> None:
+    ) -> bool:
         """Send commands to motor chain, update joint state, and optionally save to disk."""
         if getattr(self, "_reference", None) is not None and self._stop_event.is_set():
-            return
+            return False
         if (
             hasattr(self.motor_chain, "get_same_bus_device_states")
             and callable(self.motor_chain.get_same_bus_device_states)
@@ -705,6 +721,7 @@ class MotorChainRobot(Robot):
                 ee_vel=ee_vel,
                 ee_eff=ee_eff,
             )
+        return True
 
     def _motor_state_to_joint_state(self, motor_state: List[MotorInfo]) -> JointStates:
         """Convert motor state to joint state.
@@ -718,9 +735,9 @@ class MotorChainRobot(Robot):
         names = [f"joint{i + 1}" for i in range(len(motor_state))]
         if self._gripper_index is not None:
             names[self._gripper_index] = "gripper"
-        pos = np.array([motor.pos for motor in motor_state])
+        pos = np.array([motor.pos for motor in motor_state], dtype=float)
         pos = self.remapper.to_command_joint_pos_space(pos)
-        vel = np.array([motor.vel for motor in motor_state])
+        vel = np.array([motor.vel for motor in motor_state], dtype=float)
         vel = self.remapper.to_command_joint_vel_space(vel)
         eff = np.array([motor.eff for motor in motor_state])
         temp_mos = np.array([motor.temp_mos for motor in motor_state])

@@ -140,8 +140,11 @@ class AdmittedReference:
     brake: JointReference
     following_error: tuple[float, ...]
     following_velocity_error: tuple[float, ...]
+    release_gripper: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.release_gripper) is not bool:
+            raise ValueError("gripper release acknowledgement must be boolean")
         if (
             self.sequence < 0
             or not math.isfinite(self.origin)
