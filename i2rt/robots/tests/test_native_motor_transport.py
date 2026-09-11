@@ -1,5 +1,6 @@
 """Actual driver methods over fake bus I/O: no physical enable or CAN import side effects."""
 
+import inspect
 import threading
 import time
 from types import SimpleNamespace
@@ -40,6 +41,13 @@ def fake_chain() -> DMChainCanInterface:
         for i in range(2)
     ]
     return chain
+
+
+def test_guarded_expiry_is_named_without_changing_legacy_positional_commands() -> None:
+    parameters = inspect.signature(DMChainCanInterface.set_commands).parameters
+    assert parameters["valid_until"].kind == inspect.Parameter.KEYWORD_ONLY
+    for name in ("torques", "pos", "vel", "kp", "kd", "get_state"):
+        assert parameters[name].kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
 
 
 def test_cached_feedback_preserves_actual_receipt_times_and_axis_signs() -> None:

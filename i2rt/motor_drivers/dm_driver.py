@@ -841,6 +841,7 @@ class DMChainCanInterface(MotorChain):
         kp: Optional[np.ndarray] = None,
         kd: Optional[np.ndarray] = None,
         get_state: bool = True,
+        *,
         valid_until: Optional[float] = None,
     ) -> List[MotorInfo]:
         command = []
