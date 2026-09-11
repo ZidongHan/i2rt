@@ -749,6 +749,8 @@ class GripperForceLimiter:
         self._past_gripper_effort_buffer = LockFreeCircularBuffer(maxsize=1000)
         self.average_torque_window = average_torque_window
         self.debug = debug
+        self.defer_release = False  # guarded sessions require a bounded scalar replan before release
+        self.release_pending = False
         (self.clog_force_threshold, self.clog_speed_threshold, self.sign, _gripper_force_torque_map) = (
             self.gripper_type.get_gripper_limiter_params(arm_type)
         )
@@ -773,7 +775,10 @@ class GripperForceLimiter:
             normalized_target_qpos = gripper_state["target_normalized_qpos"]
             # 0 close 1 open
             if (normalized_current_qpos < normalized_target_qpos) or average_effort < 0.2:  # want to open
-                self._is_clogged = False
+                if self.defer_release:
+                    self.release_pending = True
+                else:
+                    self._is_clogged = False
         elif average_effort > self.clog_force_threshold and np.abs(current_speed) < self.clog_speed_threshold:
             self._is_clogged = True
 
@@ -784,12 +789,22 @@ class GripperForceLimiter:
         else:
             return None
 
-    def update(self, gripper_state: Dict[str, float]) -> None:
+    def acknowledge_release(self) -> None:
+        if self.release_pending:
+            self.release_pending = False
+            self._is_clogged = False
+            self._gripper_adjusted_qpos = None
+
+    def update(self, gripper_state: Dict[str, float]) -> float:
         current_ts = time.time()
         self._past_gripper_effort_buffer.put(current_ts, gripper_state["current_eff"])
         target_eff = self.compute_target_gripper_torque(gripper_state)
+        if self.release_pending:
+            return gripper_state["last_command_qpos"]
 
         if target_eff is not None:
+            if self._kp <= 0:
+                return gripper_state["last_command_qpos"]
             command_sign = np.sign(gripper_state["target_qpos"] - gripper_state["current_qpos"]) * self.sign
             current_zero_eff_pos = (
                 gripper_state["last_command_qpos"] - command_sign * np.abs(gripper_state["current_eff"]) / self._kp

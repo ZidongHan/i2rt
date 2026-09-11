@@ -1,6 +1,6 @@
 import logging
 import xml.etree.ElementTree as ET
-from functools import partial
+from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 import mujoco
@@ -10,6 +10,7 @@ from i2rt.motor_drivers.dm_driver import (
     CanInterface,
     DMChainCanInterface,
     EncoderChain,
+    MotorChain,
     PassiveEncoderReader,
     ReceiveMode,
 )
@@ -132,51 +133,51 @@ def _get_gripper_only_robot(
     )
 
 
-def get_yam_robot(
-    channel: str = "can0",
+@dataclass(frozen=True)
+class ResolvedYamRobot:
+    """Disk-only native configuration; resolving this never constructs CAN."""
+
+    motor_list: list
+    motor_offsets: list
+    directions: list
+    robot_kwargs: dict
+    sim_joint_limits: np.ndarray
+    with_teaching_handle: bool
+
+    def construct(self, motor_chain: MotorChain, **execution_options: Any) -> MotorChainRobot:
+        """Construct the same native controller over an explicitly supplied chain."""
+        try:
+            return MotorChainRobot(motor_chain=motor_chain, **(self.robot_kwargs | execution_options))
+        except Exception:
+            # Construction may have enabled motors already. Cleanup must not
+            # hide the original failure or claim that closing disabled them.
+            disable = getattr(motor_chain, "disable_motors", None)
+            if callable(disable):
+                try:
+                    logger.error("native construction failed; disable outcomes: %s", disable())
+                except Exception:
+                    logger.exception("native construction cleanup could not confirm motor disable")
+            try:
+                motor_chain.close()
+            except Exception:
+                logger.exception("native construction cleanup could not close transport")
+            raise
+
+
+def resolve_yam_robot(
     arm_type: ArmType = ArmType.YAM,
     gripper_type: GripperType = GripperType.LINEAR_4310,
-    zero_gravity_mode: bool = True,
+    *,
     ee_mass: Optional[float] = None,
     ee_inertia: Optional[np.ndarray] = None,
     gravity_comp_factor: Optional[np.ndarray] = None,
     gripper_limits_override: Optional[np.ndarray] = None,
     gripper_kp: Optional[float] = None,
     gripper_kd: Optional[float] = None,
-    sim: bool = False,
-    joint_state_saver_factory: Optional[Callable[[], Any]] = None,
-    set_realtime_and_pin_callback: Optional[Callable[[int], None]] = None,
-    enable_auto_recovery: bool = False,
-    use_coulomb_friction: bool = False,
-) -> "Robot":
-    """Create a YAM-family robot (real or sim).
-
-    Args:
-        channel: CAN interface name (e.g. "can0"). Ignored in sim mode.
-        arm_type: Which arm variant to use. A hardware revision is its own variant
-            (e.g. ``ArmType.YAM_ULTRA_2``). Use ``ArmType.NO_ARM`` for gripper-only.
-        gripper_type: Which gripper (or NO_GRIPPER / YAM_TEACHING_HANDLE).
-        zero_gravity_mode: Start in gravity-compensation mode.
-        ee_mass: Optional end-effector mass override (kg) for MuJoCo inertial.
-        ee_inertia: Optional 10-element inertia override [ipos(3), quat(4), diaginertia(3)].
-        gravity_comp_factor: Per-joint array (6 elements, arm joints only) multiplied against gravity torques.
-            Overrides the arm-type default when provided.
-        gripper_limits_override: Optional [closed, open] limits. If provided, skips calibration.
-        gripper_kp: Optional gripper kp override. Defaults to gripper_type's default.
-        gripper_kd: Optional gripper kd override. Defaults to gripper_type's default.
-        sim: If True, return a SimRobot instead of connecting to real hardware.
-        enable_auto_recovery: If True, the motor chain tries to clean+re-enable errored motors in its
-            control loop instead of failing fast. Defaults to False (fail-fast).
-        use_coulomb_friction: If True, add the per-joint Coulomb friction feedforward (from the arm
-            config) during gravity compensation. Defaults to False. Only affects real hardware; ignored
-            in sim mode (SimRobot has no friction feedforward).
-    """
-    # --- Gripper-only path (no arm) -------------------------------------------
+) -> ResolvedYamRobot:
+    """Resolve model, mappings and native defaults without motor discovery or enable."""
     if arm_type == ArmType.NO_ARM:
-        return _get_gripper_only_robot(
-            channel=channel, gripper_type=gripper_type, sim=sim, enable_auto_recovery=enable_auto_recovery
-        )
-
+        raise ValueError("gripper-only routing remains in get_yam_robot")
     with_gripper = gripper_type not in (GripperType.YAM_TEACHING_HANDLE, GripperType.NO_GRIPPER)
     with_teaching_handle = gripper_type == GripperType.YAM_TEACHING_HANDLE
 
@@ -247,40 +248,54 @@ def get_yam_robot(
         gripper_limits = gripper_type.get_gripper_limits(arm_type) if with_gripper else None
         gripper_needs_cal = gripper_type.get_gripper_needs_calibration(arm_type) if with_gripper else False
 
-    if sim:
-        from i2rt.robots.sim_robot import SimRobot
-
-        # In sim mode, grippers that need calibration have no limits yet — use [0, 1] default.
-        sim_gripper_limits = gripper_limits
-        if with_gripper and sim_gripper_limits is None:
-            sim_gripper_limits = np.array([0.0, 1.0])
-
-        sim_grav_comp = np.ones(len(motor_list))
-
-        return SimRobot(
-            xml_path=model_path,
-            n_dofs=len(motor_list),
-            joint_limits=sim_joint_limits,
-            gripper_index=n_arm_joints if with_gripper else None,
-            gripper_limits=sim_gripper_limits,
-            gravity_comp_factor=sim_grav_comp,
-            model_coordinate_adapter=model_coordinate_adapter,
+    kwargs = dict(
+        xml_path=model_path,
+        use_gravity_comp=True,
+        gravity_comp_factor=effective_gravity_comp,
+        joint_limits=joint_limits,
+        kp=kp,
+        kd=kd,
+        grav_comp_kd=grav_comp_kd,
+        coulomb_friction=coulomb_friction,
+        model_coordinate_adapter=model_coordinate_adapter,
+    )
+    if with_gripper:
+        kwargs.update(
+            gripper_index=n_arm_joints,
+            gripper_limits=gripper_limits,
+            enable_gripper_calibration=gripper_needs_cal,
+            gripper_type=gripper_type,
+            arm_type=arm_type,
+            limit_gripper_force=50.0,
         )
+    return ResolvedYamRobot(motor_list, motor_offsets, directions, kwargs, sim_joint_limits, with_teaching_handle)
 
-    # --- Real hardware path ---------------------------------------------------
 
+def create_yam_motor_chain(
+    resolved: ResolvedYamRobot,
+    channel: str,
+    *,
+    enable_auto_recovery: bool = False,
+    guarded_startup: bool = True,
+) -> DMChainCanInterface:
+    """ACTIVE hardware operation: enable/discover motors and start CAN refresh.
+
+    The caller must authorize/support the arm before this function. Guarded
+    startup never clears faults; native staged construction is a separate step.
+    """
     # Single pass: create chain, read positions, fix wrap-around offsets in-place, then start thread.
     motor_chain = DMChainCanInterface(
-        motor_list,
-        motor_offsets,
-        directions,
+        resolved.motor_list,
+        resolved.motor_offsets,
+        resolved.directions,
         channel,
         motor_chain_name="yam_real",
         receive_mode=ReceiveMode.p16,
         start_thread=False,
-        get_same_bus_device_driver=get_encoder_chain if with_teaching_handle else None,
+        get_same_bus_device_driver=get_encoder_chain if resolved.with_teaching_handle else None,
         use_buffered_reader=False,
         enable_auto_recovery=enable_auto_recovery,
+        guarded_startup=guarded_startup,
     )
     motor_states = motor_chain.read_states()
     logging.debug(f"motor_states: {motor_states}")
@@ -300,31 +315,97 @@ def get_yam_robot(
     motor_chain.start_thread()
     logging.info(f"YAM initial motor_states: {motor_chain.read_states()}")
 
-    get_robot = partial(
-        MotorChainRobot,
-        motor_chain=motor_chain,
-        xml_path=model_path,
-        use_gravity_comp=True,
-        gravity_comp_factor=effective_gravity_comp,
-        joint_limits=joint_limits,
-        kp=kp,
-        kd=kd,
-        grav_comp_kd=grav_comp_kd,
-        coulomb_friction=coulomb_friction,
+    return motor_chain
+
+
+def get_yam_robot(
+    channel: str = "can0",
+    arm_type: ArmType = ArmType.YAM,
+    gripper_type: GripperType = GripperType.LINEAR_4310,
+    zero_gravity_mode: bool = True,
+    ee_mass: Optional[float] = None,
+    ee_inertia: Optional[np.ndarray] = None,
+    gravity_comp_factor: Optional[np.ndarray] = None,
+    gripper_limits_override: Optional[np.ndarray] = None,
+    gripper_kp: Optional[float] = None,
+    gripper_kd: Optional[float] = None,
+    sim: bool = False,
+    joint_state_saver_factory: Optional[Callable[[], Any]] = None,
+    set_realtime_and_pin_callback: Optional[Callable[[int], None]] = None,
+    enable_auto_recovery: bool = False,
+    use_coulomb_friction: bool = False,
+) -> "Robot":
+    """Create a YAM-family robot (real or sim).
+
+    Args:
+        channel: CAN interface name (e.g. "can0"). Ignored in sim mode.
+        arm_type: Which arm variant to use. A hardware revision is its own variant
+            (e.g. ``ArmType.YAM_ULTRA_2``). Use ``ArmType.NO_ARM`` for gripper-only.
+        gripper_type: Which gripper (or NO_GRIPPER / YAM_TEACHING_HANDLE).
+        zero_gravity_mode: Start in gravity-compensation mode.
+        ee_mass: Optional end-effector mass override (kg) for MuJoCo inertial.
+        ee_inertia: Optional 10-element inertia override [ipos(3), quat(4), diaginertia(3)].
+        gravity_comp_factor: Per-joint array (6 elements, arm joints only) multiplied against gravity torques.
+            Overrides the arm-type default when provided.
+        gripper_limits_override: Optional [closed, open] limits. If provided, skips calibration.
+        gripper_kp: Optional gripper kp override. Defaults to gripper_type's default.
+        gripper_kd: Optional gripper kd override. Defaults to gripper_type's default.
+        sim: If True, return a SimRobot instead of connecting to real hardware.
+        enable_auto_recovery: If True, the motor chain tries to clean+re-enable errored motors in its
+            control loop instead of failing fast. Defaults to False (fail-fast).
+        use_coulomb_friction: If True, add the per-joint Coulomb friction feedforward (from the arm
+            config) during gravity compensation. Defaults to False. Only affects real hardware; ignored
+            in sim mode (SimRobot has no friction feedforward).
+    """
+    # --- Gripper-only path (no arm) -------------------------------------------
+    if arm_type == ArmType.NO_ARM:
+        return _get_gripper_only_robot(
+            channel=channel, gripper_type=gripper_type, sim=sim, enable_auto_recovery=enable_auto_recovery
+        )
+
+    resolved = resolve_yam_robot(
+        arm_type,
+        gripper_type,
+        ee_mass=ee_mass,
+        ee_inertia=ee_inertia,
+        gravity_comp_factor=gravity_comp_factor,
+        gripper_limits_override=gripper_limits_override,
+        gripper_kp=gripper_kp,
+        gripper_kd=gripper_kd,
+    )
+    config = resolved.robot_kwargs
+    with_gripper = config.get("gripper_index") is not None
+
+    if sim:
+        from i2rt.robots.sim_robot import SimRobot
+
+        # In sim mode, grippers that need calibration have no limits yet — use [0, 1] default.
+        sim_gripper_limits = config.get("gripper_limits")
+        if with_gripper and sim_gripper_limits is None:
+            sim_gripper_limits = np.array([0.0, 1.0])
+
+        sim_grav_comp = np.ones(len(resolved.motor_list))
+
+        return SimRobot(
+            xml_path=config["xml_path"],
+            n_dofs=len(resolved.motor_list),
+            joint_limits=resolved.sim_joint_limits,
+            gripper_index=config.get("gripper_index"),
+            gripper_limits=sim_gripper_limits,
+            gravity_comp_factor=sim_grav_comp,
+            model_coordinate_adapter=config.get("model_coordinate_adapter"),
+        )
+
+    # --- Real hardware path ---------------------------------------------------
+
+    motor_chain = create_yam_motor_chain(
+        resolved, channel, enable_auto_recovery=enable_auto_recovery, guarded_startup=False
+    )
+
+    return resolved.construct(
+        motor_chain,
         use_coulomb_friction=use_coulomb_friction,
-        model_coordinate_adapter=model_coordinate_adapter,
         zero_gravity_mode=zero_gravity_mode,
         joint_state_saver_factory=joint_state_saver_factory,
         set_realtime_and_pin_callback=set_realtime_and_pin_callback,
     )
-
-    if with_gripper:
-        return get_robot(
-            gripper_index=n_arm_joints,
-            gripper_limits=gripper_limits,
-            enable_gripper_calibration=gripper_needs_cal,
-            gripper_type=gripper_type,
-            arm_type=arm_type,
-            limit_gripper_force=50.0,
-        )
-    return get_robot()

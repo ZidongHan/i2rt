@@ -14,6 +14,7 @@ from i2rt.motor_drivers.dm_driver import (
     MotorInfo,
     PassiveEncoderInfo,
 )
+from i2rt.robots.joint_reference import AdmittedReference
 from i2rt.robots.model_coordinates import ModelCoordinateAdapter
 from i2rt.robots.robot import Robot
 from i2rt.robots.utils import ArmType, GripperForceLimiter, GripperType, JointMapper, detect_gripper_limits
@@ -99,6 +100,9 @@ class MotorChainRobot(Robot):
         joint_state_saver_factory: Optional[Callable[[], Any]] = None,
         set_realtime_and_pin_callback: Optional[Callable[[int], None]] = None,
         enable_auto_recovery: Optional[bool] = None,  # None: inherit motor_chain's setting; True/False: override it
+        start_server_thread: bool = True,
+        feedback_max_age_s: float = 0.05,
+        native_command_lease_s: float = 0.03,
     ) -> None:
         # Set up CPU pinning and real-time scheduling if requested
         if pinned_cpu is not None and set_realtime_and_pin_callback is not None:
@@ -237,6 +241,18 @@ class MotorChainRobot(Robot):
             self._joint_state_saver = None
 
         self._command_lock = threading.Lock()
+        self._reference: Optional[AdmittedReference] = None
+        self._reference_gravity_idle = False
+        self._reference_braking_sequence = -1
+        self._native_fault: Optional[str] = None
+        self._native_update_generation = 0
+        self._native_update_monotonic = 0.0
+        self._feedback_max_age_s = float(feedback_max_age_s)
+        self._native_command_lease_s = float(native_command_lease_s)
+        if min(feedback_max_age_s, native_command_lease_s) <= 0 or not np.all(
+            np.isfinite([feedback_max_age_s, native_command_lease_s])
+        ):
+            raise ValueError("native feedback and command lease intervals must be positive and finite")
         self._state_lock = threading.Lock()
         self._mcap_lock = threading.Lock()
         self._mcap_recorder: Optional[RobotMcapRecorder] = None
@@ -245,6 +261,10 @@ class MotorChainRobot(Robot):
             # wait to recive joint data
             time.sleep(0.05)
             self._joint_state = self._motor_state_to_joint_state(self.motor_chain.read_states())
+        if self._gripper_index is not None:
+            self._last_gripper_command_qpos = self.remapper.to_robot_joint_pos_space(self._joint_state.pos)[
+                self._gripper_index
+            ]
         self._commands = JointCommands.init_all_zero(len(motor_chain))
         if zero_gravity_mode:
             self._commands.kd = self._grav_comp_kd.copy()
@@ -254,11 +274,73 @@ class MotorChainRobot(Robot):
         self._last_motor_torques: Optional[np.ndarray] = None
         self._stop_event = threading.Event()  # Add a stop event
         self._server_thread = threading.Thread(target=self.start_server, name="robot_server")
-        self._server_thread.start()
-
-        if not zero_gravity_mode:
+        self._execution_started = False
+        # Staged construction observes only. The session must install its admitted
+        # startup brake before explicitly starting native execution.
+        if start_server_thread:
+            self._server_thread.start()
+            self._execution_started = True
+        if start_server_thread and not zero_gravity_mode:
             # set current qpos as target pos with the default PD parameters
             self.command_joint_pos(self._joint_state.pos)
+
+    def start_execution(self) -> None:
+        """Start a previously staged native update worker; never re-enable faults."""
+        if self._stop_event.is_set():
+            raise RuntimeError("closed native execution cannot restart")
+        if not self._execution_started:
+            if self._reference is None:
+                raise RuntimeError("staged execution requires an admitted startup reference")
+            self._server_thread.start()
+            self._execution_started = True
+
+    def command_joint_reference(self, reference: AdmittedReference, *, gravity_idle: bool = False) -> None:
+        """Atomically publish one admitted finite command and independent fallback.
+
+        No solve, Ruckig invocation, silent clipping or automatic fault recovery.
+        Call only from the session's commit boundary; legacy command methods are
+        not the guarded session interface.
+        """
+        if len(reference.nominal.pieces) != len(self.motor_chain):
+            raise ValueError("native reference dimension differs from motor chain")
+        if gravity_idle and not self.use_gravity_comp:
+            raise ValueError("gravity-idle is unavailable in PD-only execution")
+        if not self.use_gravity_comp and self.use_coulomb_friction:
+            raise ValueError("PD-only guarded execution cannot include Coulomb feedforward")
+        with self._command_lock:
+            if self._native_fault is not None or self._stop_event.is_set():
+                raise RuntimeError("faulted/closed native execution cannot accept references")
+            if self._reference is not None and reference.sequence <= self._reference.sequence:
+                raise ValueError("native reference sequence must advance")
+            if time.monotonic() >= reference.brake_at:
+                raise ValueError("native reference publication is already expired")
+            self._reference = reference
+            self._reference_gravity_idle = gravity_idle
+            if self._gripper_force_limiter is not None:
+                self._gripper_force_limiter.defer_release = True
+
+    def native_execution_status(self) -> Dict[str, Any]:
+        return {
+            "fault": self._native_fault,
+            "update_generation": self._native_update_generation,
+            "updated_monotonic": self._native_update_monotonic,
+            "braking_sequence": self._reference_braking_sequence,
+            "gripper_release_pending": bool(
+                self._gripper_force_limiter and self._gripper_force_limiter.release_pending
+            ),
+            "gripper_limited": bool(self._gripper_force_limiter and self._gripper_force_limiter._is_clogged),
+        }
+
+    def acknowledge_gripper_release(self) -> None:
+        """Call after committing a bounded scalar replan from current jaw feedback."""
+        with self._state_lock:
+            if self._gripper_force_limiter is not None:
+                self._gripper_force_limiter.acknowledge_release()
+
+    def disable_motors(self) -> list[dict]:
+        """Stop updates, then explicitly request per-motor disable (not close)."""
+        self._stop_event.set()
+        return self.motor_chain.disable_motors()
 
     def __repr__(self) -> str:
         return f"MotorChainRobot(arm_type={self._arm_type}, gripper_type={self._gripper_type}, motor_chain={self.motor_chain})"
@@ -363,14 +445,80 @@ class MotorChainRobot(Robot):
                 iteration_count = 0
 
     def update(self) -> None:
+        """Update native commands, retaining a guarded execution fault outcome."""
+        try:
+            self._update_once()
+        except Exception as error:
+            if self._reference is not None:
+                self._native_fault = str(error)
+                self._stop_event.set()
+                self.motor_chain.running = False
+            raise
+
+    def _update_once(self) -> None:
         """Update the robot.
 
         Send Torques and update the joint state.
         """
         with self._command_lock:
             joint_commands = copy.deepcopy(self._commands)
+            reference = self._reference
+            gravity_idle = self._reference_gravity_idle
+        if reference is not None:
+            try:
+                now = time.monotonic()
+                motors = self.motor_chain.read_states()
+                if any(
+                    m.error_code not in ("0x1", 1)
+                    or m.receive_sequence <= 0
+                    or not 0 <= now - m.received_monotonic <= self._feedback_max_age_s
+                    for m in motors
+                ):
+                    raise RuntimeError("native feedback unhealthy or stale")
+                observed = self._motor_state_to_joint_state(motors)
+                q, qd, _ = reference.at(now)
+                check_from = (
+                    (self._gripper_index if self._gripper_index is not None else len(motors))
+                    if (gravity_idle and now < reference.brake_at)
+                    else 0
+                )
+                # Object-limited aperture mismatch is not an arm execution fault.
+                # Native jaw fault/status/range checks remain separate.
+                check_to = self._gripper_index if self._gripper_index is not None else len(motors)
+                if np.any(
+                    np.abs(observed.pos[check_from:check_to] - q[check_from:check_to])
+                    > reference.following_error[check_from:check_to]
+                ):
+                    raise RuntimeError("native reference following corridor exceeded")
+                if np.any(
+                    np.abs(observed.vel[check_from:check_to] - qd[check_from:check_to])
+                    > reference.following_velocity_error[check_from:check_to]
+                ):
+                    raise RuntimeError("native reference velocity corridor exceeded")
+                joint_commands.pos = self.remapper.to_robot_joint_pos_space(q)
+                joint_commands.vel = self.remapper.to_robot_joint_vel_space(qd)
+                joint_commands.torques[:] = 0
+                joint_commands.kp = self._kp.copy()
+                joint_commands.kd = self._kd.copy()
+                if gravity_idle and now < reference.brake_at:
+                    arm_end = self._gripper_index if self._gripper_index is not None else len(motors)
+                    joint_commands.kp[:arm_end] = 0
+                    joint_commands.kd[:arm_end] = self._grav_comp_kd[:arm_end]
+                if now >= reference.brake_at:
+                    self._reference_braking_sequence = reference.sequence
+                with self._state_lock:
+                    self._joint_state = observed
+            except Exception as error:
+                self._native_fault = str(error)
+                self._stop_event.set()
+                self.motor_chain.running = False
+                raise
         with self._state_lock:
-            g = self._compute_gravity_compensation(self._joint_state)
+            g = (
+                self._compute_gravity_compensation(self._joint_state)
+                if self.use_gravity_comp
+                else np.zeros(len(self.motor_chain))
+            )
             friction_comp = (
                 self._coulomb_friction * np.sign(self._joint_state.vel) if self.use_coulomb_friction else 0.0
             )
@@ -386,7 +534,9 @@ class MotorChainRobot(Robot):
                         "current_qpos": self.remapper.to_robot_joint_pos_space(self._joint_state.pos)[
                             self._gripper_index
                         ],
-                        "current_qvel": self._joint_state.vel[self._gripper_index],
+                        "current_qvel": self.remapper.to_robot_joint_vel_space(self._joint_state.vel)[
+                            self._gripper_index
+                        ],
                         "current_eff": self._joint_state.eff[self._gripper_index],
                         "current_normalized_qpos": self._joint_state.pos[self._gripper_index],
                         "target_normalized_qpos": self.remapper.to_command_joint_pos_space(joint_commands.pos)[
@@ -395,6 +545,7 @@ class MotorChainRobot(Robot):
                         "last_command_qpos": self._last_gripper_command_qpos,
                     }
 
+                    self._gripper_force_limiter._kp = float(joint_commands.kp[self._gripper_index])
                     joint_commands.pos[self._gripper_index] = self._gripper_force_limiter.update(gripper_state)
 
                 # add final clip so the gripper won't be over-adjusted
@@ -405,6 +556,8 @@ class MotorChainRobot(Robot):
                 )
                 self._last_gripper_command_qpos = joint_commands.pos[self._gripper_index]
             self._update_joint_state(motor_torques, joint_commands)
+            self._native_update_generation += 1
+            self._native_update_monotonic = time.monotonic()
 
     def _update_joint_state(
         self,
@@ -413,6 +566,8 @@ class MotorChainRobot(Robot):
         encoder_infos: Optional[List[PassiveEncoderInfo]] = None,
     ) -> None:
         """Send commands to motor chain, update joint state, and optionally save to disk."""
+        if getattr(self, "_reference", None) is not None and self._stop_event.is_set():
+            return
         if (
             hasattr(self.motor_chain, "get_same_bus_device_states")
             and callable(self.motor_chain.get_same_bus_device_states)
@@ -425,12 +580,18 @@ class MotorChainRobot(Robot):
         else:
             has_gripper_encoder = False
 
+        lease = (
+            {"valid_until": time.monotonic() + self._native_command_lease_s}
+            if getattr(self, "_reference", None) is not None
+            else {}
+        )
         motor_state = self.motor_chain.set_commands(
             motor_torques,
             pos=joint_commands.pos,
             vel=joint_commands.vel,
             kp=joint_commands.kp,
             kd=joint_commands.kd,
+            **lease,
         )
         self._joint_state = self._motor_state_to_joint_state(motor_state)
 
@@ -591,6 +752,7 @@ class MotorChainRobot(Robot):
         Args:
             joint_pos (np.ndarray): The state to command the leader robot to.
         """
+        self._require_legacy_command_path()
         pos = self._clip_robot_joint_pos_command(joint_pos)
         with self._command_lock:
             self._commands = JointCommands.init_all_zero(len(self.motor_chain))
@@ -604,18 +766,20 @@ class MotorChainRobot(Robot):
         Args:
             joint_state (Dict[str, np.ndarray]): The state to command the leader robot to.
         """
+        self._require_legacy_command_path()
         pos = self._clip_robot_joint_pos_command(joint_state["pos"])
         vel = joint_state["vel"]
-        self._commands = JointCommands.init_all_zero(len(self.motor_chain))
         kp = joint_state.get("kp", self._kp)
         kd = joint_state.get("kd", self._kd)
         with self._command_lock:
+            self._commands = JointCommands.init_all_zero(len(self.motor_chain))
             self._commands.pos = self.remapper.to_robot_joint_pos_space(pos)
             self._commands.vel = self.remapper.to_robot_joint_vel_space(vel)
             self._commands.kp = kp
             self._commands.kd = kd
 
     def zero_torque_mode(self) -> None:
+        self._require_legacy_command_path()
         logging.info(f"Entering zero_torque_mode for {self}")
         with self._command_lock:
             self._commands = JointCommands.init_all_zero(len(self.motor_chain))
@@ -670,17 +834,19 @@ class MotorChainRobot(Robot):
             time.sleep(time_interval_s / steps)
 
     def close(self) -> None:
-        """Safely close the robot by setting all torques to zero."""
+        """Close workers and transport. This is NOT a motor-disable operation."""
         # self.move_to_zero()
         self._stop_event.set()  # Signal the thread to stop
-        self._server_thread.join()  # Wait for the thread to finish
+        if self._execution_started:
+            self._server_thread.join(timeout=1.0)
         try:
             self.motor_chain.close()
         finally:
             self.stop_mcap_recording()
-        print("Robot closed with all torques set to zero.")
+        logging.info("Robot workers/transport closed; close does not confirm motor disable")
 
     def update_kp_kd(self, kp: np.ndarray, kd: np.ndarray) -> None:
+        self._require_legacy_command_path()
         assert kp.shape == self._kp.shape == kd.shape
         self._kp = kp
         self._kd = kd
@@ -695,9 +861,16 @@ class MotorChainRobot(Robot):
         Leaves ``self._kp`` / ``self._kd`` unchanged so subsequent control
         commands still use the configured control gains.
         """
+        self._require_legacy_command_path()
         with self._command_lock:
             self._commands = JointCommands.init_all_zero(len(self.motor_chain))
             self._commands.kd = self._grav_comp_kd.copy()
+
+    def _require_legacy_command_path(self) -> None:
+        if self._reference is not None:
+            raise RuntimeError(
+                "guarded session accepts only admitted references; direct command/mode/gain mutation refused"
+            )
 
     def start_recording(self, save_dir: str) -> bool:
         """Start recording joint state data asynchronously."""

@@ -67,6 +67,12 @@ class MotorInfo:
     temp_mos: float = -1
     temp_rotor: float = -1
     timestamp: float = 0.0
+    received_monotonic: float = 0.0
+    receive_sequence: int = 0
+    sweep_id: int = 0
+    sweep_started_monotonic: float = 0.0
+    sweep_completed_monotonic: float = 0.0
+    command_id: int = 0
 
 
 @dataclass
@@ -79,6 +85,9 @@ class FeedbackFrameInfo:
     torque: float
     temperature_mos: float
     temperature_rotor: float
+    received_monotonic: float = 0.0
+    received_wall_time: float = 0.0
+    receive_sequence: int = 0
 
 
 @dataclass
