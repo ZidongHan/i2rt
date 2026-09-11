@@ -125,6 +125,22 @@ class JointReference:
             values.append(value)
         return tuple(np.asarray(values, dtype=float).T)
 
+    def jerk_at(self, elapsed: float) -> tuple[float, ...]:
+        """Right-continuous piece jerk; fixed endpoint hold has zero jerk."""
+        if not math.isfinite(elapsed):
+            raise ValueError("reference time must be finite")
+        values = []
+        for axis in self.pieces:
+            remaining = max(elapsed, 0.0)
+            jerk = 0.0
+            for piece in axis:
+                if remaining < piece.duration:
+                    jerk = piece.jerk
+                    break
+                remaining -= piece.duration
+            values.append(jerk)
+        return tuple(values)
+
 
 @dataclass(frozen=True)
 class AdmittedReference:
@@ -165,3 +181,8 @@ class AdmittedReference:
 
     def at(self, now: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         return self.nominal.at(now - self.origin) if now < self.brake_at else self.brake.at(now - self.brake_at)
+
+    def jerk_at(self, now: float) -> tuple[float, ...]:
+        return (
+            self.nominal.jerk_at(now - self.origin) if now < self.brake_at else self.brake.jerk_at(now - self.brake_at)
+        )

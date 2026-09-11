@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from i2rt.motor_drivers.utils import MotorInfo
-from i2rt.robots.joint_reference import AdmittedReference, JointReference
+from i2rt.robots.joint_reference import AdmittedReference, JerkPiece, JointReference
 from i2rt.robots.motor_chain_robot import MotorChainRobot, NativeFeedbackLimits
 
 
@@ -71,6 +71,18 @@ def stationary_packet(sequence: int = 1, horizon: float = 0.02) -> AdmittedRefer
     reference = JointReference(tuple(() for _ in range(7)), (0, 0, 0, 0, 0, 0, 0.5))
     now = time.monotonic()
     return AdmittedReference(sequence, now, now + horizon, reference, reference, (0.05,) * 7, (0.2,) * 7)
+
+
+def test_reference_jerk_reports_actual_piece_and_fallback_clock() -> None:
+    reference = JointReference(
+        ((JerkPiece(1, 0, 0, 0, 1), JerkPiece(2, 1 / 6, 0.5, 1, -1), JerkPiece(1, 11 / 6, 0.5, -1, 1)),), (2.0,)
+    )
+    packet = AdmittedReference(1, 10, 11, reference, reference.tail(1), (0.05,), (0.2,))
+    for elapsed, expected in ((0, 1), (1, -1), (2, -1), (3, 1), (4, 0), (100, 0)):
+        assert reference.jerk_at(elapsed) == (expected,)
+        assert packet.jerk_at(10 + elapsed) == (expected,)
+    with pytest.raises(ValueError, match="finite"):
+        reference.jerk_at(float("nan"))
 
 
 @pytest.mark.parametrize(

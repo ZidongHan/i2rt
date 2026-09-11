@@ -694,6 +694,7 @@ class MotorChainRobot(Robot):
                     "position_public": tuple(q),
                     "velocity_public": tuple(qd),
                     "acceleration_public": tuple(qdd),
+                    "jerk_public": reference.jerk_at(now),
                     "effective_position_public": tuple(self.remapper.to_command_joint_pos_space(joint_commands.pos)),
                     "effective_velocity_public": tuple(self.remapper.to_command_joint_vel_space(joint_commands.vel)),
                     "kp_raw_motor": tuple(joint_commands.kp),
