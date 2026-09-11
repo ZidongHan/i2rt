@@ -100,6 +100,13 @@ def test_native_reference_maps_raw_jaw_and_sets_sender_expiry() -> None:
         robot.update()
         assert robot.native_execution_status()["braking_sequence"] == 1
         assert robot.native_execution_status()["update_generation"] == 2
+        sample = robot.native_execution_status()["reference_sample"]
+        assert sample["sequence"] == packet.sequence
+        assert sample["evaluated_monotonic"] >= packet.origin
+        assert sample["update_completed_monotonic"] >= sample["evaluated_monotonic"]
+        assert sample["position_public"] == packet.nominal.stationary_positions
+        assert sample["effective_position_public"] == packet.nominal.stationary_positions
+        assert sample["feedforward_raw_motor_nm"] == (0.0,) * 7
     finally:
         robot.close()
 

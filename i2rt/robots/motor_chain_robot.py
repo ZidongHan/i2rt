@@ -248,6 +248,7 @@ class MotorChainRobot(Robot):
         self._native_fault: Optional[str] = None
         self._native_update_generation = 0
         self._native_update_monotonic = 0.0
+        self._native_reference_sample: Optional[Dict[str, Any]] = None
         self._feedback_max_age_s = float(feedback_max_age_s)
         self._native_command_lease_s = float(native_command_lease_s)
         if min(feedback_max_age_s, native_command_lease_s) <= 0 or not np.all(
@@ -330,6 +331,7 @@ class MotorChainRobot(Robot):
             "fault": self._native_fault,
             "update_generation": self._native_update_generation,
             "updated_monotonic": self._native_update_monotonic,
+            "reference_sample": self._native_reference_sample,
             "braking_sequence": self._reference_braking_sequence,
             "active_reference_sequence": None if self._reference is None else self._reference.sequence,
             "pending_reference_sequence": None
@@ -511,7 +513,7 @@ class MotorChainRobot(Robot):
                 ):
                     raise RuntimeError("native feedback unhealthy or stale")
                 observed = self._motor_state_to_joint_state(motors)
-                q, qd, _ = reference.at(now)
+                q, qd, qdd = reference.at(now)
                 check_from = (
                     (self._gripper_index if self._gripper_index is not None else len(motors))
                     if (gravity_idle and now < reference.brake_at)
@@ -598,6 +600,24 @@ class MotorChainRobot(Robot):
             self._update_joint_state(motor_torques, joint_commands)
             self._native_update_generation += 1
             self._native_update_monotonic = time.monotonic()
+            if reference is not None:
+                # Actual native evaluation, not a future published packet sampled
+                # early by the supervisor. This is command evidence, NOT a claim
+                # of simultaneous motor replies or observed position arrival.
+                self._native_reference_sample = {
+                    "sequence": reference.sequence,
+                    "evaluated_monotonic": now,
+                    "update_completed_monotonic": self._native_update_monotonic,
+                    "position_public": tuple(q),
+                    "velocity_public": tuple(qd),
+                    "acceleration_public": tuple(qdd),
+                    "effective_position_public": tuple(self.remapper.to_command_joint_pos_space(joint_commands.pos)),
+                    "effective_velocity_public": tuple(self.remapper.to_command_joint_vel_space(joint_commands.vel)),
+                    "kp_raw_motor": tuple(joint_commands.kp),
+                    "kd_raw_motor": tuple(joint_commands.kd),
+                    "feedforward_raw_motor_nm": tuple(motor_torques),
+                    "gravity_idle": bool(gravity_idle and now < reference.brake_at),
+                }
 
     def _update_joint_state(
         self,
