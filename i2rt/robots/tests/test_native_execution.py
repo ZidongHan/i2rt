@@ -150,3 +150,28 @@ def test_gripper_contact_mismatch_is_not_arm_fault_and_disable_is_explicit() -> 
         assert len(chain.commands) == count
     finally:
         robot.close()
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_future_reference_waits_for_origin_and_braking_discards_it(monkeypatch: Any, cancel: bool) -> None:
+    robot, _chain = robot_fixture()
+    try:
+        now = time.monotonic()
+        clock = [now]
+        monkeypatch.setattr("i2rt.robots.motor_chain_robot.time.monotonic", lambda: clock[0])
+        first = stationary_packet()
+        robot.command_joint_reference(first)
+        successor = replace(first, sequence=2, origin=now + 0.02, brake_at=now + 0.04)
+        robot.command_joint_reference(successor)
+        robot.update()
+        assert robot.native_execution_status()["active_reference_sequence"] == 1
+        assert robot.native_execution_status()["pending_reference_sequence"] == 2
+        if cancel:
+            assert robot.request_controlled_braking() == first
+        clock[0] += 0.021
+        robot.update()
+        assert robot.native_execution_status()["active_reference_sequence"] == (1 if cancel else 2)
+        assert robot.native_execution_status()["pending_reference_sequence"] is None
+        assert robot.native_execution_status()["braking_sequence"] == (1 if cancel else -1)
+    finally:
+        robot.close()

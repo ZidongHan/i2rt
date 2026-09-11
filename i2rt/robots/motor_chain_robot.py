@@ -242,6 +242,7 @@ class MotorChainRobot(Robot):
 
         self._command_lock = threading.Lock()
         self._reference: Optional[AdmittedReference] = None
+        self._pending_reference: Optional[Tuple[AdmittedReference, bool]] = None
         self._reference_gravity_idle = False
         self._reference_braking_sequence = -1
         self._native_fault: Optional[str] = None
@@ -310,12 +311,17 @@ class MotorChainRobot(Robot):
         with self._command_lock:
             if self._native_fault is not None or self._stop_event.is_set():
                 raise RuntimeError("faulted/closed native execution cannot accept references")
-            if self._reference is not None and reference.sequence <= self._reference.sequence:
+            latest = self._pending_reference[0] if self._pending_reference else self._reference
+            if latest is not None and reference.sequence <= latest.sequence:
                 raise ValueError("native reference sequence must advance")
             if time.monotonic() >= reference.brake_at:
                 raise ValueError("native reference publication is already expired")
-            self._reference = reference
-            self._reference_gravity_idle = gravity_idle
+            if self._reference is not None and reference.origin > time.monotonic():
+                self._pending_reference = (reference, gravity_idle)
+            else:
+                self._reference = reference
+                self._reference_gravity_idle = gravity_idle
+                self._pending_reference = None
             if self._gripper_force_limiter is not None:
                 self._gripper_force_limiter.defer_release = True
 
@@ -325,6 +331,10 @@ class MotorChainRobot(Robot):
             "update_generation": self._native_update_generation,
             "updated_monotonic": self._native_update_monotonic,
             "braking_sequence": self._reference_braking_sequence,
+            "active_reference_sequence": None if self._reference is None else self._reference.sequence,
+            "pending_reference_sequence": None
+            if self._pending_reference is None
+            else self._pending_reference[0].sequence,
             "gripper_release_pending": bool(
                 self._gripper_force_limiter and self._gripper_force_limiter.release_pending
             ),
@@ -336,6 +346,17 @@ class MotorChainRobot(Robot):
         with self._state_lock:
             if self._gripper_force_limiter is not None:
                 self._gripper_force_limiter.acknowledge_release()
+
+    def request_controlled_braking(self) -> Optional[AdmittedReference]:
+        """Cancel the next proposal; consume the active packet's admitted brake.
+
+        The remaining admitted nominal prefix lasts at most its current release
+        horizon. Never jump directly to a future brake's initial joint state.
+        The session invalidates its planner epoch before calling this method.
+        """
+        with self._command_lock:
+            self._pending_reference = None
+            return self._reference
 
     def disable_motors(self) -> list[dict]:
         """Stop updates, then explicitly request per-motor disable (not close)."""
@@ -418,17 +439,26 @@ class MotorChainRobot(Robot):
         """Start the server."""
         last_time = time.time()
         iteration_count = 0
-        self.update()
-
         logging.info("initializing, ....")
 
         while not self._stop_event.is_set():  # Check the stop event
             current_time = time.time()
             elapsed_time = current_time - last_time
 
-            self.update()
-            if not self.motor_chain.running:
-                raise RuntimeError(f"{self}: motor_chain_robot's motor chain is not running, exiting the robot server")
+            try:
+                self.update()
+                if self._stop_event.is_set():
+                    return
+                if not self.motor_chain.running:
+                    raise RuntimeError(f"{self}: motor chain is not running, exiting the robot server")
+            except Exception as error:
+                if self._reference is None:
+                    raise  # Preserve the legacy thread behavior for legacy callers.
+                self._native_fault = str(error)
+                self._stop_event.set()
+                self.motor_chain.running = False
+                logging.exception("guarded native execution ended; fault is available through native_execution_status")
+                return
             time.sleep(0.001)
 
             iteration_count += 1
@@ -461,13 +491,18 @@ class MotorChainRobot(Robot):
         Send Torques and update the joint state.
         """
         with self._command_lock:
+            if self._reference is not None and self._stop_event.is_set():
+                return
+            if self._pending_reference is not None and time.monotonic() >= self._pending_reference[0].origin:
+                self._reference, self._reference_gravity_idle = self._pending_reference
+                self._pending_reference = None
             joint_commands = copy.deepcopy(self._commands)
             reference = self._reference
             gravity_idle = self._reference_gravity_idle
         if reference is not None:
             try:
-                now = time.monotonic()
                 motors = self.motor_chain.read_states()
+                now = time.monotonic()
                 if any(
                     m.error_code not in ("0x1", 1)
                     or m.receive_sequence <= 0
@@ -490,11 +525,13 @@ class MotorChainRobot(Robot):
                     > reference.following_error[check_from:check_to]
                 ):
                     raise RuntimeError("native reference following corridor exceeded")
-                if np.any(
-                    np.abs(observed.vel[check_from:check_to] - qd[check_from:check_to])
-                    > reference.following_velocity_error[check_from:check_to]
-                ):
-                    raise RuntimeError("native reference velocity corridor exceeded")
+                velocity_error = np.abs(observed.vel[check_from:check_to] - qd[check_from:check_to])
+                if np.any(velocity_error > reference.following_velocity_error[check_from:check_to]):
+                    raise RuntimeError(
+                        "native reference velocity corridor exceeded: "
+                        f"observed={observed.vel[check_from:check_to].tolist()}, "
+                        f"reference={qd[check_from:check_to].tolist()}, command={reference.sequence}"
+                    )
                 joint_commands.pos = self.remapper.to_robot_joint_pos_space(q)
                 joint_commands.vel = self.remapper.to_robot_joint_vel_space(qd)
                 joint_commands.torques[:] = 0
@@ -504,6 +541,9 @@ class MotorChainRobot(Robot):
                     arm_end = self._gripper_index if self._gripper_index is not None else len(motors)
                     joint_commands.kp[:arm_end] = 0
                     joint_commands.kd[:arm_end] = self._grav_comp_kd[:arm_end]
+                    # Native gravity-idle damps measured motion toward zero;
+                    # a measured-state fallback must not become a velocity target.
+                    joint_commands.vel[:arm_end] = 0
                 if now >= reference.brake_at:
                     self._reference_braking_sequence = reference.sequence
                 with self._state_lock:

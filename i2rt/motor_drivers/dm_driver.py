@@ -787,6 +787,9 @@ class DMChainCanInterface(MotorChain):
                 )
             )
         with self.command_lock:
+            if self._command_valid_until is not None and time.monotonic() >= self._command_valid_until:
+                self.running = False
+                raise RuntimeError("expired native producer cannot renew CAN refresh")
             if valid_until is not None and (not np.isfinite(valid_until) or valid_until <= time.monotonic()):
                 raise ValueError("native command deadline must be finite and in the future")
             self.commands = command

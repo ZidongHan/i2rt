@@ -69,6 +69,44 @@ class JointReference:
     def duration(self) -> float:
         return max(sum(piece.duration for piece in axis) for axis in self.pieces)
 
+    def tail(self, elapsed: float) -> "JointReference":
+        """Keep the exact remaining polynomials; do not reset moving derivatives."""
+        if not math.isfinite(elapsed) or elapsed < 0:
+            raise ValueError("reference tail time must be finite and nonnegative")
+        axes = []
+        for axis in self.pieces:
+            remaining = elapsed
+            tail = []
+            for piece in axis:
+                if remaining >= piece.duration:
+                    remaining -= piece.duration
+                    continue
+                p, v, a = piece.at(remaining)
+                tail.append(JerkPiece(piece.duration - remaining, p, v, a, piece.jerk))
+                remaining = 0.0
+            axes.append(tuple(tail))
+        return JointReference(tuple(axes), self.stationary_positions)
+
+    def with_continuation(self, elapsed: float, continuation: "JointReference") -> "JointReference":
+        """Retain the exact prefix, then an independently admitted continuation."""
+        if not math.isfinite(elapsed) or elapsed < 0 or len(self.pieces) != len(continuation.pieces):
+            raise ValueError("invalid continuation time or dimensions")
+        axes = []
+        for index, axis in enumerate(self.pieces):
+            remaining = elapsed
+            prefix = []
+            for piece in axis:
+                duration = min(piece.duration, remaining)
+                if duration > 0:
+                    prefix.append(JerkPiece(duration, piece.position, piece.velocity, piece.acceleration, piece.jerk))
+                remaining -= duration
+                if remaining <= 0:
+                    break
+            if remaining > 0:
+                prefix.append(JerkPiece(remaining, self.stationary_positions[index], 0.0, 0.0, 0.0))
+            axes.append(tuple(prefix) + continuation.pieces[index])
+        return JointReference(tuple(axes), continuation.stationary_positions)
+
     def at(self, elapsed: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if not math.isfinite(elapsed):
             raise ValueError("reference time must be finite")

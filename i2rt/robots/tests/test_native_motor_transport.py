@@ -75,6 +75,17 @@ def test_native_command_expiry_is_atomic_and_stops_actual_sender() -> None:
     assert len(calls) == 2
 
 
+def test_expired_native_producer_cannot_revive_its_command_lease() -> None:
+    chain = fake_chain()
+    chain.set_commands(np.zeros(2), valid_until=time.monotonic() + 1)
+    previous_id = chain._command_id
+    chain._command_valid_until = time.monotonic() - 0.01
+    with pytest.raises(RuntimeError, match="expired native producer"):
+        chain.set_commands(np.ones(2), valid_until=time.monotonic() + 1)
+    assert not chain.running
+    assert chain._command_id == previous_id
+
+
 def test_disable_reports_partial_failure_and_does_not_call_enable() -> None:
     chain = fake_chain()
     calls = []
