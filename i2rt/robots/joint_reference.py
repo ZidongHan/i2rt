@@ -11,6 +11,16 @@ from dataclasses import dataclass
 import numpy as np
 
 
+def _same_state(first: tuple[float, ...], second: tuple[float, ...]) -> bool:
+    """The existing asymmetric 1e-8 abs/relative tolerance, without tiny arrays.
+
+    Finite immutable pieces are repeatedly joined/tailed on the native planning
+    path. Three scalar comparisons preserve the contract without allocating
+    NumPy arrays for every polynomial boundary. NaN/overflow still fail closed.
+    """
+    return all(abs(a - b) <= 1e-8 + 1e-8 * abs(b) for a, b in zip(first, second, strict=True))
+
+
 @dataclass(frozen=True)
 class JerkPiece:
     duration: float
@@ -58,14 +68,14 @@ class JointReference:
             previous = None
             for piece in axis:
                 start = (piece.position, piece.velocity, piece.acceleration)
-                if previous is not None and not np.allclose(previous, start, rtol=1e-8, atol=1e-8):
+                if previous is not None and not _same_state(previous, start):
                     raise ValueError(
                         f"reference contains a discontinuous polynomial boundary at coordinate {coordinate}: "
                         f"previous p/v/a={previous}, next p/v/a={start}"
                     )
                 previous = piece.at(piece.duration)
             if previous is not None:
-                if not np.allclose(previous, (stationary, 0.0, 0.0), rtol=1e-8, atol=1e-8):
+                if not _same_state(previous, (stationary, 0.0, 0.0)):
                     raise ValueError("reference must finish at its stationary position with zero derivatives")
 
     @property

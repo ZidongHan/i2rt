@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from i2rt.motor_drivers.utils import MotorInfo
-from i2rt.robots.joint_reference import AdmittedReference, JerkPiece, JointReference
+from i2rt.robots.joint_reference import AdmittedReference, JerkPiece, JointReference, _same_state
 from i2rt.robots.motor_chain_robot import MotorChainRobot, NativeFeedbackLimits
 
 
@@ -71,6 +71,16 @@ def stationary_packet(sequence: int = 1, horizon: float = 0.02) -> AdmittedRefer
     reference = JointReference(tuple(() for _ in range(7)), (0, 0, 0, 0, 0, 0, 0.5))
     now = time.monotonic()
     return AdmittedReference(sequence, now, now + horizon, reference, reference, (0.05,) * 7, (0.2,) * 7)
+
+
+def test_scalar_reference_continuity_keeps_numpy_tolerance() -> None:
+    random = np.random.default_rng(42)
+    for _ in range(3000):
+        second = random.uniform(-4, 4, 3)
+        first = second + random.uniform(-2, 2, 3) * (1e-8 + 1e-8 * np.abs(second))
+        assert _same_state(tuple(first), tuple(second)) == np.allclose(first, second, atol=1e-8, rtol=1e-8)
+    assert not _same_state((float("nan"), 0, 0), (0, 0, 0))
+    assert not _same_state((float("inf"), 0, 0), (0, 0, 0))
 
 
 def test_reference_jerk_reports_actual_piece_and_fallback_clock() -> None:
