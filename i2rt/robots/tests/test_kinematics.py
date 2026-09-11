@@ -1,3 +1,5 @@
+import time
+
 import mink
 import numpy as np
 import pytest
@@ -25,6 +27,36 @@ def test_fk(kinematics_yam: Kinematics) -> None:
     start_trans = np.array([0.1105973, 0.0000010, 0.1735018])
     np.testing.assert_allclose(rotation, start_rot, atol=1e-5)
     np.testing.assert_allclose(translation, start_trans, atol=1e-5)
+
+
+def test_expired_diagnostic_ik_does_not_call_qp(kinematics_yam: Kinematics, monkeypatch: pytest.MonkeyPatch) -> None:
+    seed = np.zeros(6)
+    pose = kinematics_yam.fk(seed)
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        pytest.fail("expired diagnostic solve must not enter a QP")
+
+    monkeypatch.setattr(mink, "solve_ik", forbidden)
+    result = kinematics_yam.ik_with_diagnostics(pose, "grasp_site", init_q=seed, deadline_at=time.monotonic() - 1)
+    assert not result.success and result.failure_reason == "deadline_exceeded"
+    assert result.iterations == 0
+    np.testing.assert_array_equal(result.solution, seed)
+
+
+def test_late_qp_result_is_not_integrated_or_reported_converged(
+    kinematics_yam: Kinematics, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seed = np.zeros(6)
+    pose = kinematics_yam.fk(seed)
+
+    def slow(*args: object, **kwargs: object) -> np.ndarray:
+        time.sleep(0.02)
+        return np.ones(6)
+
+    monkeypatch.setattr(mink, "solve_ik", slow)
+    result = kinematics_yam.ik_with_diagnostics(pose, "grasp_site", init_q=seed, deadline_at=time.monotonic() + 0.005)
+    assert not result.success and result.failure_reason == "deadline_exceeded"
+    np.testing.assert_array_equal(result.solution, seed)
 
 
 def test_ik_smoke(kinematics_yam: Kinematics) -> None:

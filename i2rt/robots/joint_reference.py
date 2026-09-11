@@ -54,12 +54,15 @@ class JointReference:
             raise ValueError("reference coordinate dimensions differ")
         if not all(math.isfinite(x) for x in self.stationary_positions):
             raise ValueError("reference positions must be finite")
-        for axis, stationary in zip(self.pieces, self.stationary_positions, strict=True):
+        for coordinate, (axis, stationary) in enumerate(zip(self.pieces, self.stationary_positions, strict=True)):
             previous = None
             for piece in axis:
                 start = (piece.position, piece.velocity, piece.acceleration)
                 if previous is not None and not np.allclose(previous, start, rtol=1e-8, atol=1e-8):
-                    raise ValueError("reference contains a discontinuous polynomial boundary")
+                    raise ValueError(
+                        f"reference contains a discontinuous polynomial boundary at coordinate {coordinate}: "
+                        f"previous p/v/a={previous}, next p/v/a={start}"
+                    )
                 previous = piece.at(piece.duration)
             if previous is not None:
                 if not np.allclose(previous, (stationary, 0.0, 0.0), rtol=1e-8, atol=1e-8):

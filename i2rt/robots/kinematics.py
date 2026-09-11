@@ -133,11 +133,16 @@ class Kinematics:
         damping: float,
         limits: Optional[List[mink.Limit]],
         max_iters: int,
+        deadline_at: float | None = None,
     ) -> Iterator[np.ndarray]:
         """Shared numerical kernel; each public entry point owns termination/failure policy."""
         tasks = [task]
         for _ in range(max_iters):
+            if deadline_at is not None and time.monotonic() >= deadline_at:
+                raise TimeoutError("IK original deadline expired")
             velocity = mink.solve_ik(self._configuration, tasks, dt, solver, damping=damping, limits=limits)
+            if deadline_at is not None and time.monotonic() >= deadline_at:
+                raise TimeoutError("IK solver returned after its original deadline")
             self._configuration.integrate_inplace(velocity, dt)
             yield task.compute_error(self._configuration)
 
@@ -211,6 +216,8 @@ class Kinematics:
         init_q: Optional[np.ndarray] = None,
         limits: Optional[List[mink.Limit]] = None,
         options: Optional[IKDiagnosticOptions] = None,
+        *,
+        deadline_at: float | None = None,
     ) -> IKDiagnosticResult:
         """Solve IK and retain immutable numerical diagnostics.
 
@@ -222,6 +229,8 @@ class Kinematics:
         """
         options = IKDiagnosticOptions() if options is None else options
         options.validate()
+        if deadline_at is not None and not np.isfinite(deadline_at):
+            raise ValueError("IK deadline must be a finite absolute monotonic timestamp")
         target = np.asarray(target_pose, dtype=float)
         if target.shape != (4, 4) or not np.all(np.isfinite(target)):
             raise ValueError("IK diagnostic target_pose must be a finite 4x4 transform")
@@ -251,6 +260,7 @@ class Kinematics:
                     damping=options.damping,
                     limits=effective_limits,
                     max_iters=options.max_iters,
+                    **({} if deadline_at is None else {"deadline_at": deadline_at}),
                 ),
                 start=1,
             ):
@@ -264,6 +274,8 @@ class Kinematics:
                     break
         except mink.NoSolutionFound:
             failure_reason = "qp_no_solution"
+        except TimeoutError:
+            failure_reason = "deadline_exceeded"
 
         error = end_effector_task.compute_error(self._configuration)
         jacobian = end_effector_task.compute_jacobian(self._configuration)
@@ -273,6 +285,8 @@ class Kinematics:
         solution = self._configuration.q.copy()
         joint_delta = solution - seed
         margin = self._minimum_joint_limit_margin(solution)
+        if deadline_at is not None and time.monotonic() >= deadline_at:
+            success, failure_reason = False, "deadline_exceeded"
         return IKDiagnosticResult(
             success=success,
             failure_reason=failure_reason,
