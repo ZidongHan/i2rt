@@ -277,6 +277,7 @@ def create_yam_motor_chain(
     *,
     enable_auto_recovery: bool = False,
     guarded_startup: bool = True,
+    transaction_timeout_s: float = 0.02,
 ) -> DMChainCanInterface:
     """ACTIVE hardware operation: enable/discover the configured motors.
 
@@ -297,6 +298,7 @@ def create_yam_motor_chain(
         use_buffered_reader=False,
         enable_auto_recovery=enable_auto_recovery,
         guarded_startup=guarded_startup,
+        transaction_timeout_s=transaction_timeout_s,
     )
     motor_states = motor_chain.read_states()
     logging.debug(f"motor_states: {motor_states}")

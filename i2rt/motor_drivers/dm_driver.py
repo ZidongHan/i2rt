@@ -390,6 +390,7 @@ class DMChainCanInterface(MotorChain):
         control_freq: float = CONTROL_FREQ,  # Control loop frequency (Hz), used for the CAN bandwidth check
         enable_auto_recovery: bool = False,  # if True, try to clean+re-enable errored motors in the control loop instead of failing fast
         guarded_startup: bool = False,
+        transaction_timeout_s: float = 0.02,
     ):
         assert not use_buffered_reader, (
             "buffered reader is not very stable, the latest encoder fix allows us to use the non-buffered reader"
@@ -413,6 +414,8 @@ class DMChainCanInterface(MotorChain):
         self._guarded_startup = guarded_startup
         if guarded_startup and enable_auto_recovery:
             raise ValueError("guarded startup forbids automatic motor recovery")
+        if not np.isfinite(transaction_timeout_s) or transaction_timeout_s <= 0:
+            raise ValueError("transaction_timeout_s must be finite and positive")
         logging.info(f"Channel: {channel}, Bitrate: {bitrate}")
         if "can" in channel:
             self.motor_interface = DMSingleMotorCanInterface(
@@ -457,8 +460,8 @@ class DMChainCanInterface(MotorChain):
         self._command_valid_until = None  # legacy callers retain their existing refresh contract
         if guarded_startup:
             # A bounded individual exchange is also used during enable/discovery.
-            # Qualified installations can choose a stricter timeout before use.
-            self.motor_interface.transaction_timeout_s = 0.02
+            # The installation passes its reviewed bound before any enable.
+            self.motor_interface.transaction_timeout_s = transaction_timeout_s
         self.state_lock = threading.Lock()
         self._report_interval = report_interval
         self._rate_recorder = RateRecorder(name=self, report_interval=report_interval)

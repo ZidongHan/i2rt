@@ -10,7 +10,7 @@ import pytest
 
 from i2rt.motor_drivers.utils import MotorInfo
 from i2rt.robots.joint_reference import AdmittedReference, JointReference
-from i2rt.robots.motor_chain_robot import MotorChainRobot
+from i2rt.robots.motor_chain_robot import MotorChainRobot, NativeFeedbackLimits
 
 
 class FakeChain:
@@ -69,6 +69,49 @@ def stationary_packet(sequence: int = 1, horizon: float = 0.02) -> AdmittedRefer
     reference = JointReference(tuple(() for _ in range(7)), (0, 0, 0, 0, 0, 0, 0.5))
     now = time.monotonic()
     return AdmittedReference(sequence, now, now + horizon, reference, reference, (0.05,) * 7, (0.2,) * 7)
+
+
+@pytest.mark.parametrize(
+    ("change", "match"),
+    [
+        ({"pos": float("nan")}, "nonfinite"),
+        ({"eff": 21.0}, "raw motor effort"),
+        ({"temp_mos": 81.0}, "temperature"),
+        ({"vel": 4.0}, "joint velocity"),
+        ({"sweep_id": 99}, "incoherent"),
+    ],
+)
+def test_native_installation_health_checks_precede_actuation(change: dict, match: str) -> None:
+    robot, chain = robot_fixture()
+    robot._feedback_limits = NativeFeedbackLimits(
+        ((-3, 3),) * 6 + ((0, 1),), (0.001,) * 7, (3.0,) * 7, (20.0,) * 7, (80.0,) * 7, 0.01
+    )
+    try:
+        chain.states[0] = replace(chain.states[0], **change)
+        robot.command_joint_reference(stationary_packet())
+        with pytest.raises(RuntimeError, match=match):
+            robot.update()
+        assert not chain.commands and not chain.running
+        assert robot.native_execution_status()["fault"]
+    finally:
+        robot.close()
+
+
+def test_native_health_persistence_is_not_extended_by_cache_polling() -> None:
+    robot, chain = robot_fixture()
+    robot._feedback_limits = NativeFeedbackLimits(
+        ((-3, 3),) * 6 + ((0, 1),), (0.001,) * 7, (3.0,) * 7, (20.0,) * 7, (80.0,) * 7, 0.01, 0.01
+    )
+    try:
+        chain.states[0] = replace(chain.states[0], temp_rotor=90)
+        robot.command_joint_reference(stationary_packet(horizon=1))
+        robot.update()
+        time.sleep(0.012)
+        with pytest.raises(RuntimeError, match="temperature"):
+            robot.update()
+        assert len(chain.commands) == 1
+    finally:
+        robot.close()
 
 
 def test_staged_native_does_not_publish_and_requires_initial_reference() -> None:

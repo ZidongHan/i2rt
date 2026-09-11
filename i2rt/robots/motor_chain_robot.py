@@ -63,6 +63,36 @@ class JointCommands:
         )
 
 
+@dataclass(frozen=True)
+class NativeFeedbackLimits:
+    """Optional installation-qualified public travel and raw-motor health bounds."""
+
+    position: Tuple[Tuple[float, float], ...]
+    position_noise: Tuple[float, ...]
+    velocity: Tuple[float, ...]
+    motor_effort_nm: Tuple[float, ...]
+    temperature_c: Tuple[float, ...]
+    maximum_sweep_skew_s: float
+    persistence_s: float = 0.0
+
+    def validate(self, size: int) -> None:
+        position = np.asarray(self.position)
+        if (
+            position.shape != (size, 2)
+            or not np.all(np.isfinite(position))
+            or np.any(position[:, 0] >= position[:, 1])
+        ):
+            raise ValueError("native feedback position bounds must be finite ordered public pairs")
+        for name in ("position_noise", "velocity", "motor_effort_nm", "temperature_c"):
+            value = np.asarray(getattr(self, name))
+            if value.shape != (size,) or not np.all(np.isfinite(value)) or np.any(value <= 0):
+                raise ValueError(f"native feedback {name} must contain positive finite per-motor bounds")
+        if not np.isfinite(self.maximum_sweep_skew_s) or self.maximum_sweep_skew_s <= 0:
+            raise ValueError("native maximum_sweep_skew_s must be positive")
+        if not np.isfinite(self.persistence_s) or self.persistence_s < 0:
+            raise ValueError("native feedback persistence_s must be finite and nonnegative")
+
+
 class MotorChainRobot(Robot):
     """A generic Robot protocol."""
 
@@ -103,6 +133,7 @@ class MotorChainRobot(Robot):
         start_server_thread: bool = True,
         feedback_max_age_s: float = 0.05,
         native_command_lease_s: float = 0.03,
+        feedback_limits: NativeFeedbackLimits | None = None,
     ) -> None:
         # Set up CPU pinning and real-time scheduling if requested
         if pinned_cpu is not None and set_realtime_and_pin_callback is not None:
@@ -252,6 +283,10 @@ class MotorChainRobot(Robot):
         self._native_reference_sample: Optional[Dict[str, Any]] = None
         self._feedback_max_age_s = float(feedback_max_age_s)
         self._native_command_lease_s = float(native_command_lease_s)
+        self._feedback_limits = feedback_limits
+        self._health_violation_since: dict[str, float] = {}
+        if feedback_limits is not None:
+            feedback_limits.validate(len(motor_chain))
         if min(feedback_max_age_s, native_command_lease_s) <= 0 or not np.all(
             np.isfinite([feedback_max_age_s, native_command_lease_s])
         ):
@@ -488,6 +523,35 @@ class MotorChainRobot(Robot):
                 self.motor_chain.running = False
             raise
 
+    def _check_native_feedback_limits(self, motors: list[MotorInfo], observed: JointStates, now: float) -> None:
+        limits = self._feedback_limits
+        if not np.all(np.isfinite((observed.pos, observed.vel))):
+            raise RuntimeError("native feedback position/velocity is nonfinite")
+        if limits is None:
+            return  # Explicitly retained legacy/simulation fixture contract.
+        stamps = [motor.received_monotonic for motor in motors]
+        if np.ptp(stamps) > limits.maximum_sweep_skew_s or len({m.sweep_id for m in motors}) != 1:
+            raise RuntimeError("native feedback sweep is incoherent")
+        effort = np.asarray([motor.eff for motor in motors])
+        temperatures = np.asarray([[motor.temp_mos, motor.temp_rotor] for motor in motors])
+        if not np.all(np.isfinite(effort)) or not np.all(np.isfinite(temperatures)):
+            raise RuntimeError("native motor effort/temperature feedback is unavailable or nonfinite")
+        positions = np.asarray(limits.position)
+        violations = {
+            "public joint travel": np.any(observed.pos < positions[:, 0] - limits.position_noise)
+            or np.any(observed.pos > positions[:, 1] + limits.position_noise),
+            "public joint velocity": np.any(np.abs(observed.vel) > limits.velocity),
+            "raw motor effort": np.any(np.abs(effort) > limits.motor_effort_nm),
+            "motor temperature": np.any(temperatures > np.asarray(limits.temperature_c)[:, None]),
+        }
+        for name, exceeded in violations.items():
+            if exceeded:
+                since = self._health_violation_since.setdefault(name, now)
+                if now - since >= limits.persistence_s:
+                    raise RuntimeError(f"native installation envelope exceeded: {name}")
+            else:
+                self._health_violation_since.pop(name, None)
+
     def _update_once(self) -> None:
         """Update the robot.
 
@@ -514,6 +578,7 @@ class MotorChainRobot(Robot):
                 ):
                     raise RuntimeError("native feedback unhealthy or stale")
                 observed = self._motor_state_to_joint_state(motors)
+                self._check_native_feedback_limits(motors, observed, now)
                 q, qd, qdd = reference.at(now)
                 check_from = (
                     (self._gripper_index if self._gripper_index is not None else len(motors))
