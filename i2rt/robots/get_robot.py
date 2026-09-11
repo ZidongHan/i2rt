@@ -304,13 +304,18 @@ def create_yam_motor_chain(
     logging.debug(f"motor_states: {motor_states}")
 
     logging.info(f"current_pos: {[m.pos for m in motor_states]}")
-    for idx, state in enumerate(motor_states):
-        if state.pos < -np.pi:
-            logging.info(f"motor {idx} pos={state.pos:.3f}, offset -2π")
-            motor_chain.motor_offset[idx] -= 2 * np.pi
-        elif state.pos > np.pi:
-            logging.info(f"motor {idx} pos={state.pos:.3f}, offset +2π")
-            motor_chain.motor_offset[idx] += 2 * np.pi
+    if not guarded_startup:
+        # Legacy discovery heuristic. Guarded installations already declare
+        # reviewed encoder offsets and saved jaw endpoints; rewriting an offset
+        # from the current pose would invalidate that calibration (jaw stroke can
+        # exceed 2π) and reinterpret legitimate nonzero startup configurations.
+        for idx, state in enumerate(motor_states):
+            if state.pos < -np.pi:
+                logging.info(f"motor {idx} pos={state.pos:.3f}, offset -2π")
+                motor_chain.motor_offset[idx] -= 2 * np.pi
+            elif state.pos > np.pi:
+                logging.info(f"motor {idx} pos={state.pos:.3f}, offset +2π")
+                motor_chain.motor_offset[idx] += 2 * np.pi
 
     logging.info(f"adjusted motor_offsets: {motor_chain.motor_offset.tolist()}")
 

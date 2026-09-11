@@ -836,6 +836,10 @@ def detect_gripper_limits(
     max_duration: float = 2.0,
     position_threshold: float = 0.01,
     check_interval: float = 0.1,
+    *,
+    command_validity_s: Optional[float] = None,
+    progress_callback: Optional[Callable[[], None]] = None,
+    require_confirmed_stops: bool = False,
 ) -> Tuple[float, float]:
     """
     Detect gripper limits by applying test torques and monitoring position changes.
@@ -847,21 +851,48 @@ def detect_gripper_limits(
         max_duration: Maximum test duration for each direction (s)
         position_threshold: Minimum position change to consider motor still moving (rad)
         check_interval: Time interval between checks (s)
+        command_validity_s: Finite command lease for a guarded, initially stopped sender.
+        progress_callback: Nonblocking operator/feedback supervision before each renewal.
+        require_confirmed_stops: Refuse incomplete searches instead of accepting timed-out extrema.
 
     Returns:
         List of detected limits [limit1, limit2]
     """
     logger = logging.getLogger(__name__)
+    values = [test_torque, max_duration, position_threshold, check_interval]
+    if not np.all(np.isfinite(values)) or min(values) <= 0:
+        raise ValueError("gripper search parameters must be finite and positive")
+    if command_validity_s is not None and (
+        not np.isfinite(command_validity_s) or not 0.02 <= command_validity_s <= 0.1
+    ):
+        raise ValueError("guarded gripper search command validity must be 20-100 ms")
     positions = []
     num_motors = len(motor_chain.motor_list)
     zero_torques = np.zeros(num_motors)
+    sender_started = False
+
+    def supervise_interval(torques: np.ndarray, duration: float) -> None:
+        nonlocal sender_started
+        if command_validity_s is None:
+            motor_chain.set_commands(torques=torques)
+            time.sleep(duration)
+            return
+        end = time.monotonic() + duration
+        while time.monotonic() < end:
+            if progress_callback is not None:
+                progress_callback()
+            motor_chain.set_commands(torques=torques, valid_until=time.monotonic() + command_validity_s)
+            if not sender_started:
+                motor_chain.start_thread()
+                sender_started = True
+            time.sleep(min(0.01, max(0, end - time.monotonic())))
 
     # Get motor direction for the gripper
     motor_direction = motor_chain.motor_direction[gripper_index]
 
     # Record initial position
     initial_states = motor_chain.read_states()
-    init_torque = np.array([state.eff for state in initial_states])
+    init_torque = np.array([state.eff for state in initial_states], dtype=float)
     initial_pos = initial_states[gripper_index].pos
     positions.append(initial_pos)
     logger.info(f"Gripper calibration starting from position: {initial_pos:.4f}")
@@ -869,16 +900,15 @@ def detect_gripper_limits(
     # Test both directions
     for direction in [1, -1]:
         logger.info(f"Testing gripper direction: {direction}")
-        test_torques = init_torque
+        test_torques = init_torque.copy()
         test_torques[gripper_index] = direction * test_torque
 
-        start_time = time.time()
+        start_time = time.monotonic()
         last_pos = None
         position_stable_count = 0
 
-        while time.time() - start_time < max_duration:
-            motor_chain.set_commands(torques=test_torques)
-            time.sleep(check_interval)
+        while time.monotonic() - start_time < max_duration:
+            supervise_interval(test_torques, min(check_interval, max_duration - (time.monotonic() - start_time)))
 
             states = motor_chain.read_states()
             current_pos = states[gripper_index].pos
@@ -899,11 +929,19 @@ def detect_gripper_limits(
 
             last_pos = current_pos
 
-        time.sleep(0.3)
+        if require_confirmed_stops and position_stable_count < 3:
+            raise RuntimeError(f"gripper endpoint search timed out without a confirmed stop in direction {direction}")
+        if command_validity_s is None:
+            time.sleep(0.3)
+        else:
+            # Do not continue pressing an endpoint during the inter-search dwell.
+            supervise_interval(zero_torques, 0.3)
 
     # Calculate detected limits
     min_pos = min(positions)
     max_pos = max(positions)
+    if require_confirmed_stops and max_pos - min_pos <= position_threshold:
+        raise RuntimeError("gripper search did not establish distinct endpoints")
 
     # Order based on motor direction
     if motor_direction > 0:
