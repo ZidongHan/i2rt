@@ -594,7 +594,11 @@ class MotorChainRobot(Robot):
                     np.abs(observed.pos[check_from:check_to] - q[check_from:check_to])
                     > reference.following_error[check_from:check_to]
                 ):
-                    raise RuntimeError("native reference following corridor exceeded")
+                    raise RuntimeError(
+                        "native reference following corridor exceeded: "
+                        f"observed={observed.pos[check_from:check_to].tolist()}, "
+                        f"reference={q[check_from:check_to].tolist()}, command={reference.sequence}"
+                    )
                 velocity_error = np.abs(observed.vel[check_from:check_to] - qd[check_from:check_to])
                 if np.any(velocity_error > reference.following_velocity_error[check_from:check_to]):
                     raise RuntimeError(
