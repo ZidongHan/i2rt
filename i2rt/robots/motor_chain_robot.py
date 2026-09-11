@@ -534,7 +534,9 @@ class MotorChainRobot(Robot):
             raise RuntimeError("native feedback sweep is incoherent")
         effort = np.asarray([motor.eff for motor in motors])
         temperatures = np.asarray([[motor.temp_mos, motor.temp_rotor] for motor in motors])
-        if not np.all(np.isfinite(effort)) or not np.all(np.isfinite(temperatures)):
+        if not np.all(np.isfinite(effort)) or not np.all(np.isfinite(temperatures)) or np.any(temperatures < 0):
+            # DAMIAO encodes temperatures as unsigned bytes. The API's -1
+            # sentinel means no temperature measurement, not a cold motor.
             raise RuntimeError("native motor effort/temperature feedback is unavailable or nonfinite")
         positions = np.asarray(limits.position)
         violations = {

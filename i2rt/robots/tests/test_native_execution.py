@@ -23,6 +23,8 @@ class FakeChain:
                 id=i + 1,
                 error_code="0x1",
                 pos=0 if i < 6 else -1,
+                temp_mos=25,
+                temp_rotor=25,
                 received_monotonic=time.monotonic(),
                 receive_sequence=i + 1,
             )
@@ -77,6 +79,8 @@ def stationary_packet(sequence: int = 1, horizon: float = 0.02) -> AdmittedRefer
         ({"pos": float("nan")}, "nonfinite"),
         ({"eff": 21.0}, "raw motor effort"),
         ({"temp_mos": 81.0}, "temperature"),
+        ({"temp_mos": -1.0}, "unavailable"),
+        ({"temp_rotor": float("nan")}, "nonfinite"),
         ({"vel": 4.0}, "joint velocity"),
         ({"sweep_id": 99}, "incoherent"),
     ],
