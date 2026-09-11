@@ -9,6 +9,29 @@ or comment, that uncertainty is stated explicitly.
 
 For task-oriented examples and units, first read the [standard YAM API guide](yam-api-guide.md).
 
+## Guarded-session extension versus the legacy trace
+
+The [guarded API overview](yam-api-guide.md#guarded-native-sessions-lab-fork-september-11) describes the lab's
+September 11 extension. The numbered trace below preserves the legacy factory semantics; it must not be used
+to infer that the new native session repeats stale setpoints, rewrites calibrated offsets or automatically
+clears startup faults. The guarded path uses these existing owners:
+
+| Stage | Guarded behavior |
+| --- | --- |
+| Resolution and discovery | Resolve without I/O; authorized discovery/enable with bounded transactions and no fault clearing; exact reviewed offsets and saved jaw endpoints |
+| Initial command | Feedback-qualified measured position, velocity and derived acceleration → admitted brake → start native execution; no implicit teleport or stationary reset |
+| Nominal execution | Finite joint polynomials evaluated against monotonic time by `MotorChainRobot`; native MIT PD plus configured static gravity and optional native signed friction |
+| Loss of new intent | The admitted brake retains its original deadline; producer and updater/sender lifetimes cannot be refreshed by a stale repeated command |
+| Feedback | Genuine receive sequence/time/status, measured q/qd/effort and available temperatures; disabled or stale feedback does not become a healthy command rejection |
+| Jaw obstruction | Existing raw-motor effort/speed limiter; measured scalar replan and activation acknowledgement on release; no arm-history rewind of aperture |
+| Shutdown | Explicit per-motor disable acknowledgements, including unknown outcomes; then transport cleanup. No firmware timeout change or automatic re-enable |
+
+`joint_reference.py` is immutable execution data, not another IK solver. The outer session owns preparation,
+admission, observed arrival, terminal controls and recording. Restricted jaw-only endpoint search uses the
+same motor transport with finite command authority; it never enables the six arm motors as a calibration shortcut.
+Simulation replaces only the chain and does not emulate firmware, CAN packet timing or measured grasp force.
+Actual packets/partial-enable/failure cases are tested over fake transport separately.
+
 ## 1. What this repository does—and does not do—to DAMIAO firmware
 
 The normal YAM control path does **not** upload, replace, or toggle between DAMIAO firmware images. It communicates

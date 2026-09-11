@@ -27,6 +27,30 @@ owns the unqualified commissioning boundary. The underlying vendor API being imp
 outer PocketNav or general policy hardware route is enabled. `SimRobot` is state/API simulation, not the outer
 stepped synthetic plant and not a motor model.
 
+### Guarded native sessions (lab fork, September 11)
+
+The paired deployment project's [native session](../../yam-policy-deployment/docs/run-native-point-tracking.md)
+uses a staged path alongside the legacy `get_yam_robot` examples below:
+
+- `resolve_yam_robot` resolves defaults, complete models and mappings without motor I/O.
+- `create_yam_motor_chain(..., guarded_startup=True)` is **active physical discovery/enable**, not preflight.
+  It preserves reviewed encoder offsets, does not clear faults and leaves the repeated sender stopped.
+- `ResolvedYamRobot.construct` builds the existing `MotorChainRobot` on the selected chain. Guarded execution
+  requires fresh measured-state initialization and an admitted finite reference before `start_execution()`.
+- `command_joint_reference` publishes an immutable timed joint reference with its precomputed braking
+  continuation. The native updater evaluates it and retains the same MIT PD, gravity and jaw limiter owners.
+  Legacy direct setpoint/idle methods cannot bypass an enabled guarded reference interface.
+- `request_controlled_braking` selects the admitted continuation. Observed settling and operator state belong
+  to the outer session, not this call. `native_execution_status` exposes publication, feedback, limiter and fault
+  evidence. `disable_motors` attempts explicit individual disables and returns their acknowledgement outcomes.
+  `close()` still does not substitute for supported disable.
+
+The outer force-driven `mujoco-actuation` chain consumes these same native commands; it is not `SimRobot`.
+PD-only supplies zero additive torque, without disabling physical/world gravity. Native feedback guards,
+command/producer lifetimes and guarded calibration have fake-I/O tests; no physical qualification is implied.
+Installation authority, source handling and the pause/recovery state machine remain in the outer project.
+The following historical sections describe the legacy public factory unless explicitly stated otherwise.
+
 ## 1. The control model in one page
 
 The standard YAM has six revolute arm joints. A motorized gripper adds one controllable coordinate:
