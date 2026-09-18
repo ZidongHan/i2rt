@@ -18,6 +18,7 @@ from i2rt.robots.utils import ArmType, GripperType, _load_arm_config, _load_grip
 from i2rt.utils.mujoco_utils import MuJoCoKDL
 
 CUSTOM_GRIPPERS = (
+    GripperType.LINEAR_4310_STOCK,
     GripperType.LINEAR_4310_SOFT,
     GripperType.LINEAR_4310_SOFT_IPHONE_15_PRO,
     GripperType.LINEAR_4310_SOFT_IPHONE_15_PRO_MAX,
@@ -52,11 +53,12 @@ def test_named_coordinate_round_trip_and_effort_sign(gripper: GripperType) -> No
     public = np.array([0.2, 0.8, 0.6, -0.2, 0.15, 0.3, 0.5])
     model = adapter.public_position_to_model(public)
 
-    np.testing.assert_allclose(model, [0.2, 0.8, 0.6, -0.2, 0.15, -0.3, -0.02375, -0.02375])
+    sign = 1 if gripper == GripperType.LINEAR_4310_STOCK else -1
+    np.testing.assert_allclose(model, [0.2, 0.8, 0.6, -0.2, 0.15, sign * 0.3, sign * 0.02375, sign * 0.02375])
     np.testing.assert_allclose(adapter.model_position_to_public(model), public)
     np.testing.assert_allclose(adapter.model_velocity_to_public(adapter.public_velocity_to_model(public)), public)
     np.testing.assert_allclose(
-        adapter.model_effort_to_public(np.arange(1.0, 9.0)), [1.0, 2.0, 3.0, 4.0, 5.0, -6.0, 0.0]
+        adapter.model_effort_to_public(np.arange(1.0, 9.0)), [1.0, 2.0, 3.0, 4.0, 5.0, sign * 6.0, 0.0]
     )
 
 
@@ -90,7 +92,10 @@ def test_custom_sim_robot_has_seven_public_and_eight_model_coordinates(gripper: 
     assert robot.num_dofs() == 7
     assert robot._model.nq == 8
     np.testing.assert_allclose(robot.get_joint_pos(), target)
-    np.testing.assert_allclose(robot._data.qpos, [0.2, 0.8, 0.6, -0.2, 0.15, -0.3, -0.02375, -0.02375])
+    sign = 1 if gripper == GripperType.LINEAR_4310_STOCK else -1
+    np.testing.assert_allclose(
+        robot._data.qpos, [0.2, 0.8, 0.6, -0.2, 0.15, sign * 0.3, sign * 0.02375, sign * 0.02375]
+    )
     assert robot.get_motor_torques() is not None
     assert robot.get_motor_torques().shape == (7,)
     assert robot.get_motor_torques()[6] == 0.0

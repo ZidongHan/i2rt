@@ -64,6 +64,7 @@ class FakePhysicalExchange:
 @pytest.mark.parametrize(
     "gripper",
     (
+        GripperType.LINEAR_4310_STOCK,
         GripperType.LINEAR_4310_SOFT,
         GripperType.LINEAR_4310_SOFT_IPHONE_15_PRO,
         GripperType.LINEAR_4310_SOFT_IPHONE_15_PRO_MAX,

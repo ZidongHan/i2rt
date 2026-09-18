@@ -137,7 +137,7 @@
   "schema_version": "yam-coordinate-map/v1",
   "source": {
     "config_schema": "yam-model/v1",
-    "config_sha256": "270f15d0b9e7bc5ecc429cfdea0b26eda9129cbf103e07eb32019c280a4dc7a6",
+    "config_sha256": "77b5f9dfd43e581ce7e94af4100e161616670d25c922a066224e45f5ed0f41f9",
     "urdf": "source/assemblies/linear_4310_soft_iphone_15_pro/yam.urdf",
     "urdf_sha256": "832b923075ce5f0a679dfa9615ce47f4889350fec69d2d143447599bd386f5c6"
   }

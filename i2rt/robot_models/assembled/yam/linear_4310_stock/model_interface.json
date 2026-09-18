@@ -1,5 +1,5 @@
 {
-  "assembly": "linear_4310_soft",
+  "assembly": "linear_4310_stock",
   "generator_version": "yam-complete-model-generator/v1",
   "model_effort_to_public": {
     "joint1": {
@@ -23,7 +23,7 @@
       "target": "joint5"
     },
     "joint6": {
-      "scale": -1.0,
+      "scale": 1.0,
       "target": "joint6"
     }
   },
@@ -65,24 +65,26 @@
     },
     "joint6": {
       "offset": 0.0,
-      "scale": -1.0,
+      "scale": 1.0,
       "source": "joint6"
     },
     "joint7": {
       "offset": 0.0,
-      "scale": -0.0475,
+      "scale": 0.0475,
       "source": "gripper"
     },
     "joint8": {
       "offset": 0.0,
-      "scale": -0.0475,
+      "scale": 0.0475,
       "source": "gripper"
     }
   },
-  "model_xml": "linear_4310_soft.xml",
+  "model_xml": "linear_4310_stock.xml",
   "named_frames": {
     "yam_tool": {
-      "assemblies": "all",
+      "assemblies": [
+        "linear_4310_stock"
+      ],
       "mjcf_site_name": "grasp_site",
       "parent": "gripper",
       "quaternion_wxyz": [
@@ -94,7 +96,7 @@
       "translation_m": [
         0.0,
         0.0,
-        -0.1937
+        -0.1347
       ]
     }
   },
@@ -115,7 +117,7 @@
   "source": {
     "config_schema": "yam-model/v1",
     "config_sha256": "77b5f9dfd43e581ce7e94af4100e161616670d25c922a066224e45f5ed0f41f9",
-    "urdf": "source/assemblies/linear_4310_soft/yam.urdf",
-    "urdf_sha256": "d2c14cfc95fa976b678dc25b180ecf67f007f29eeba7146dd573e8f34a13c6e3"
+    "urdf": "source/assemblies/linear_4310_stock/yam.urdf",
+    "urdf_sha256": "4d869699077fb565734481c26d42d0dbdb615c20a63241c8bdf2d31095be902e"
   }
 }

@@ -22,6 +22,7 @@ _CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config")
 logger = logging.getLogger(__name__)
 
 _GRIPPER_HARDWARE_CONFIG_NAMES = {
+    "linear_4310_stock": "linear_4310",
     "linear_4310_soft": "linear_4310",
     "linear_4310_soft_iphone_15_pro": "linear_4310",
     "linear_4310_soft_iphone_15_pro_max": "linear_4310",
@@ -489,6 +490,7 @@ class GripperType(enum.Enum):
     LINEAR_4310_SOFT = "linear_4310_soft"
     LINEAR_4310_SOFT_IPHONE_15_PRO = "linear_4310_soft_iphone_15_pro"
     LINEAR_4310_SOFT_IPHONE_15_PRO_MAX = "linear_4310_soft_iphone_15_pro_max"
+    LINEAR_4310_STOCK = "linear_4310_stock"  # complete deployment model; LINEAR_4310 still composes
 
     # technically not a gripper
     YAM_TEACHING_HANDLE = "yam_teaching_handle"

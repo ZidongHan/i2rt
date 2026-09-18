@@ -1,5 +1,10 @@
 # Standard YAM API guide
 
+The lab deployment registry also includes `GripperType.LINEAR_4310_STOCK`: a complete-model
+snapshot of standard YAM with stock hard fingers. It reuses `linear_4310.yml` hardware settings,
+seven public coordinates and eight model joints. Its joint6 mapping is identity and jaw mapping
+is `+0.0475 * gripper`. The existing `GripperType.LINEAR_4310` runtime composition remains unchanged.
+
 This guide explains the public Python surface for the **standard i2RT YAM** arm. Its stock behavior was originally
 reviewed at `v1.2.4` (`5d47b35`); the lab-fork complete-model extensions below were rechecked on 2026-09-08.
 Other arm products and Flow Base are excluded. Hardware examples describe API effects, not a qualified lab SOP.
