@@ -18,9 +18,10 @@ clears startup faults. The guarded path uses these existing owners:
 
 | Stage | Guarded behavior |
 | --- | --- |
-| Resolution and discovery | Resolve without I/O; authorized discovery/enable with bounded transactions and no fault clearing; exact reviewed offsets and saved jaw endpoints |
+| Resolution and discovery | Resolve without I/O; authorized discovery/enable with bounded transactions and no fault clearing; exact reviewed offsets and calibration-aware selection of the saved jaw endpoints' current single-turn branch |
 | Initial command | Feedback-qualified measured position, velocity and derived acceleration → admitted brake → start native execution; no implicit teleport or stationary reset |
 | Nominal execution | Finite joint polynomials evaluated against monotonic time by `MotorChainRobot`; native MIT PD plus configured static gravity and optional native signed friction |
+| Scheduled handoff | Recheck a pending reference after feedback acquisition against the actual evaluation time; never evaluate an expired predecessor merely because the update began before the successor origin |
 | Loss of new intent | The admitted brake retains its original deadline; producer and updater/sender lifetimes cannot be refreshed by a stale repeated command |
 | Feedback | Genuine receive sequence/time/status, measured q/qd/effort and available temperatures; disabled or stale feedback does not become a healthy command rejection |
 | Jaw obstruction | Existing raw-motor effort/speed limiter; measured scalar replan and activation acknowledgement on release; no arm-history rewind of aperture |
@@ -227,6 +228,14 @@ The motor-specific numeric ranges are used again to dequantize position, velocit
 2. applies `(raw_position - software_offset) * direction`;
 3. multiplies velocity and torque feedback by `direction`; and
 4. maps gripper position/velocity from raw angle to normalized public coordinates.
+
+For guarded deployment with saved gripper calibration, the raw chain is deliberately available before step 4's
+`JointMapper` is constructed. The startup owner combines the retained enable response with two progressing
+zero-gain/zero-effort feedback sweeps and finds the unique integer-period shift whose complete saved endpoint
+interval is representable by the motor and contains every observed J7 position within the installation-derived
+endpoint tolerance. A refusal disables and closes the chain. Success changes only the session's effective
+`[closed, open]` endpoints; endpoint difference, velocity scaling, firmware zero and the permanent calibration
+remain unchanged. The ordinary 25-rad MIT packet unwrap does not perform this output-revolution reconciliation.
 
 No gear-ratio conversion appears in this host path. The code assumes the decoded position already has the joint
 coordinate convention expected by the model, apart from sign/offset and gripper normalization.

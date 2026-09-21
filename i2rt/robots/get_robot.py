@@ -1,6 +1,8 @@
 import logging
+import math
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from itertools import pairwise
 from typing import Any, Callable, Optional
 
 import mujoco
@@ -14,6 +16,7 @@ from i2rt.motor_drivers.dm_driver import (
     PassiveEncoderReader,
     ReceiveMode,
 )
+from i2rt.motor_drivers.utils import MotorType
 from i2rt.robots.model_coordinates import ModelCoordinateAdapter
 from i2rt.robots.motor_chain_robot import MotorChainRobot
 from i2rt.robots.robot import Robot
@@ -25,6 +28,39 @@ from i2rt.robots.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class GripperLimitReconciliation:
+    """One motionless choice of a saved gripper calibration's periodic branch."""
+
+    gripper_index: int
+    motor_id: int
+    motor_type: str
+    branch_index: int
+    period_rad: float
+    calibration_limits_rad: tuple[float, float]
+    effective_limits_rad: tuple[float, float]
+    feedback_positions_rad: tuple[float, ...]
+    feedback_receive_sequences: tuple[int, ...]
+    endpoint_tolerance_rad: float
+    calibrated_coordinate_limits_rad: tuple[float, float]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": "i2rt-gripper-limit-reconciliation/v1",
+            "gripper_index": self.gripper_index,
+            "motor_id": self.motor_id,
+            "motor_type": self.motor_type,
+            "branch_index": self.branch_index,
+            "period_rad": self.period_rad,
+            "calibration_limits_rad": list(self.calibration_limits_rad),
+            "effective_limits_rad": list(self.effective_limits_rad),
+            "feedback_positions_rad": list(self.feedback_positions_rad),
+            "feedback_receive_sequences": list(self.feedback_receive_sequences),
+            "endpoint_tolerance_rad": self.endpoint_tolerance_rad,
+            "calibrated_coordinate_limits_rad": list(self.calibrated_coordinate_limits_rad),
+        }
 
 
 def _load_joint_limits_from_xml(*xml_paths: str) -> np.ndarray:
@@ -143,11 +179,15 @@ class ResolvedYamRobot:
     robot_kwargs: dict
     sim_joint_limits: np.ndarray
     with_teaching_handle: bool
+    gripper_limit_reconciliation: GripperLimitReconciliation | None = None
 
     def construct(self, motor_chain: MotorChain, **execution_options: Any) -> MotorChainRobot:
         """Construct the same native controller over an explicitly supplied chain."""
         try:
-            return MotorChainRobot(motor_chain=motor_chain, **(self.robot_kwargs | execution_options))
+            options = self.robot_kwargs | execution_options
+            if self.gripper_limit_reconciliation is not None:
+                options["gripper_limit_reconciliation"] = self.gripper_limit_reconciliation.as_dict()
+            return MotorChainRobot(motor_chain=motor_chain, **options)
         except Exception:
             # Construction may have enabled motors already. Cleanup must not
             # hide the original failure or claim that closing disabled them.
@@ -325,6 +365,152 @@ def create_yam_motor_chain(
     logging.info(f"YAM initial motor_states: {motor_chain.read_states()}")
 
     return motor_chain
+
+
+def reconcile_guarded_gripper_limits(
+    resolved: ResolvedYamRobot,
+    motor_chain: DMChainCanInterface,
+    *,
+    period_rad: float = 2 * np.pi,
+    endpoint_tolerance_rad: float = 0.0,
+    feedback_sample_count: int = 3,
+    feedback_sweep_timeout_s: float = 0.05,
+) -> ResolvedYamRobot:
+    """Select one saved gripper-calibration branch from guarded startup feedback.
+
+    This is an active guarded-startup operation: after the enable response it
+    obtains additional zero-gain, zero-effort feedback sweeps while the normal
+    sender remains stopped. It never changes firmware zero, software offsets or
+    the supplied calibration. On any refusal it disables and closes the chain so
+    no caller can accidentally continue with unreconciled endpoints.
+    """
+
+    def fail_closed() -> None:
+        try:
+            motor_chain.disable_motors()
+        except Exception:
+            logger.exception("gripper branch reconciliation could not confirm motor disable")
+        try:
+            motor_chain.close()
+        except Exception:
+            logger.exception("gripper branch reconciliation could not close transport")
+
+    try:
+        if resolved.gripper_limit_reconciliation is not None:
+            raise ValueError("gripper limits have already been reconciled for this startup")
+        if not motor_chain.requires_staged_start:
+            raise ValueError("gripper branch reconciliation requires guarded startup before sender activation")
+        if type(feedback_sample_count) is not int or feedback_sample_count < 3:
+            raise ValueError("gripper branch reconciliation requires at least three feedback samples")
+        if (
+            not np.isfinite(period_rad)
+            or period_rad <= 0
+            or not np.isfinite(endpoint_tolerance_rad)
+            or endpoint_tolerance_rad < 0
+            or not np.isfinite(feedback_sweep_timeout_s)
+            or feedback_sweep_timeout_s <= 0
+        ):
+            raise ValueError("gripper branch period/tolerance/feedback timeout must be finite and valid")
+
+        gripper_index = resolved.robot_kwargs.get("gripper_index")
+        limits = resolved.robot_kwargs.get("gripper_limits")
+        if gripper_index is None or limits is None:
+            raise ValueError("saved gripper limits are required for startup branch reconciliation")
+        if gripper_index != len(resolved.motor_list) - 1 or len(motor_chain) != len(resolved.motor_list):
+            raise ValueError("gripper branch reconciliation requires the resolved complete motor chain")
+        calibration = np.asarray(limits, dtype=float)
+        if calibration.shape != (2,) or not np.all(np.isfinite(calibration)) or calibration[0] == calibration[1]:
+            raise ValueError("saved gripper limits must contain two distinct finite endpoints")
+        lower, upper = sorted(float(value) for value in calibration)
+        if upper - lower + 2 * endpoint_tolerance_rad >= period_rad:
+            raise ValueError("saved gripper span plus endpoint tolerance must be smaller than one period")
+
+        motor_id, motor_type = resolved.motor_list[gripper_index]
+        constants = MotorType.get_motor_constants(motor_type)
+        direction = resolved.directions[gripper_index]
+        offset = resolved.motor_offsets[gripper_index]
+        calibrated_coordinate_limits = tuple(
+            sorted(
+                (
+                    (constants.POSITION_MIN - offset) * direction,
+                    (constants.POSITION_MAX - offset) * direction,
+                )
+            )
+        )
+
+        positions: list[float] = []
+        sequences: list[int] = []
+        for sample_index in range(feedback_sample_count):
+            states = (
+                motor_chain.read_states()
+                if sample_index == 0
+                else motor_chain.acquire_startup_feedback(maximum_duration_s=feedback_sweep_timeout_s)
+            )
+            if len(states) != len(resolved.motor_list):
+                raise RuntimeError("gripper branch feedback does not contain the resolved motor chain")
+            state = states[gripper_index]
+            if (
+                state.id != motor_id
+                or state.error_code not in ("0x1", 1)
+                or state.receive_sequence <= 0
+                or not np.all(np.isfinite([state.pos, state.vel, state.eff, state.received_monotonic]))
+            ):
+                raise RuntimeError("gripper branch feedback is unhealthy, incomplete or mismatched")
+            positions.append(float(state.pos))
+            sequences.append(int(state.receive_sequence))
+        if any(second <= first for first, second in pairwise(sequences)):
+            raise RuntimeError("gripper branch feedback did not progress across startup sweeps")
+
+        protocol_lower, protocol_upper = calibrated_coordinate_limits
+        first_k = math.floor((protocol_lower - lower) / period_rad) - 1
+        last_k = math.ceil((protocol_upper - upper) / period_rad) + 1
+        representable = {
+            k
+            for k in range(first_k, last_k + 1)
+            if lower + k * period_rad >= protocol_lower and upper + k * period_rad <= protocol_upper
+        }
+        matching = representable.copy()
+        for position in positions:
+            matching &= {
+                k
+                for k in representable
+                if lower + k * period_rad - endpoint_tolerance_rad
+                <= position
+                <= upper + k * period_rad + endpoint_tolerance_rad
+            }
+        if len(matching) != 1:
+            raise RuntimeError(
+                "saved gripper calibration has no unique representable startup branch: "
+                f"feedback={positions}, calibration={calibration.tolist()}, "
+                f"period={period_rad}, candidates={sorted(matching)}"
+            )
+
+        branch_index = matching.pop()
+        effective = calibration + branch_index * period_rad
+        reconciliation = GripperLimitReconciliation(
+            gripper_index=gripper_index,
+            motor_id=motor_id,
+            motor_type=motor_type,
+            branch_index=branch_index,
+            period_rad=float(period_rad),
+            calibration_limits_rad=tuple(float(value) for value in calibration),
+            effective_limits_rad=tuple(float(value) for value in effective),
+            feedback_positions_rad=tuple(positions),
+            feedback_receive_sequences=tuple(sequences),
+            endpoint_tolerance_rad=float(endpoint_tolerance_rad),
+            calibrated_coordinate_limits_rad=calibrated_coordinate_limits,
+        )
+        kwargs = resolved.robot_kwargs.copy()
+        kwargs["gripper_limits"] = effective
+        logger.info("Selected guarded gripper calibration branch: %s", reconciliation.as_dict())
+        return replace(
+            resolved,
+            robot_kwargs=kwargs,
+            gripper_limit_reconciliation=reconciliation,
+        )
+    except BaseException:
+        fail_closed()
+        raise
 
 
 def get_yam_robot(

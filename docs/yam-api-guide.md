@@ -40,10 +40,17 @@ uses a staged path alongside the legacy `get_yam_robot` examples below:
 - `resolve_yam_robot` resolves defaults, complete models and mappings without motor I/O.
 - `create_yam_motor_chain(..., guarded_startup=True)` is **active physical discovery/enable**, not preflight.
   It preserves reviewed encoder offsets, does not clear faults and leaves the repeated sender stopped.
+- A deployment using saved sub-revolution gripper endpoints calls
+  `reconcile_guarded_gripper_limits(...)` in that stopped interval. The retained enable response and two
+  progressing zero-gain/zero-effort feedback sweeps must select one representable calibration interval modulo one
+  output revolution. The selected endpoints apply only to that powered session; the saved calibration and firmware
+  zero are not rewritten.
 - `ResolvedYamRobot.construct` builds the existing `MotorChainRobot` on the selected chain. Guarded execution
   requires fresh measured-state initialization and an admitted finite reference before `start_execution()`.
 - `command_joint_reference` publishes an immutable timed joint reference with its precomputed braking
   continuation. The native updater evaluates it and retains the same MIT PD, gravity and jaw limiter owners.
+  A future successor is selected against the evaluation time after feedback acquisition, so crossing its origin
+  during a CAN read cannot evaluate the expired predecessor's braking/full-stiffness branch for one update.
   Legacy direct setpoint/idle methods cannot bypass an enabled guarded reference interface.
 - `request_controlled_braking` selects the admitted continuation. Observed settling and operator state belong
   to the outer session, not this call. `native_execution_status` exposes publication, feedback, limiter and fault

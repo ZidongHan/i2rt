@@ -134,6 +134,7 @@ class MotorChainRobot(Robot):
         feedback_max_age_s: float = 0.05,
         native_command_lease_s: float = 0.03,
         feedback_limits: NativeFeedbackLimits | None = None,
+        gripper_limit_reconciliation: dict[str, Any] | None = None,
     ) -> None:
         # Set up CPU pinning and real-time scheduling if requested
         if pinned_cpu is not None and set_realtime_and_pin_callback is not None:
@@ -143,6 +144,7 @@ class MotorChainRobot(Robot):
         self._set_realtime_and_pin_callback = set_realtime_and_pin_callback
         self._arm_type = arm_type
         self._gripper_type = gripper_type
+        self._gripper_limit_reconciliation = copy.deepcopy(gripper_limit_reconciliation)
         self._model_coordinate_adapter = model_coordinate_adapter
         if model_coordinate_adapter is not None and len(model_coordinate_adapter.public_names) != len(motor_chain):
             raise ValueError(
@@ -383,6 +385,7 @@ class MotorChainRobot(Robot):
                 self._gripper_force_limiter and self._gripper_force_limiter.release_pending
             ),
             "gripper_limited": bool(self._gripper_force_limiter and self._gripper_force_limiter._is_clogged),
+            "gripper_limit_reconciliation": copy.deepcopy(self._gripper_limit_reconciliation),
         }
 
     def request_controlled_braking(self) -> Optional[AdmittedReference]:
@@ -462,6 +465,7 @@ class MotorChainRobot(Robot):
             "use_coulomb_friction": self.use_coulomb_friction,
             "joint_limits": self._joint_limits,
             "gripper_limits": self._gripper_limits,
+            "gripper_limit_reconciliation": copy.deepcopy(self._gripper_limit_reconciliation),
             "gravity_comp_factor": self.gravity_comp_factor,
             "gripper_index": self._gripper_index,
             "enable_auto_recovery": getattr(self.motor_chain, "enable_auto_recovery", False),
@@ -572,6 +576,17 @@ class MotorChainRobot(Robot):
             try:
                 motors = self.motor_chain.read_states()
                 now = time.monotonic()
+                # A native update may start just before a scheduled handoff and
+                # finish its feedback read just after it. Select the reference
+                # against the actual evaluation time so an expired predecessor
+                # cannot apply its braking/full-stiffness branch for one update.
+                with self._command_lock:
+                    if self._pending_reference is not None and now >= self._pending_reference[0].origin:
+                        self._reference, self._reference_gravity_idle = self._pending_reference
+                        self._pending_reference = None
+                    reference = self._reference
+                    gravity_idle = self._reference_gravity_idle
+                assert reference is not None
                 if any(
                     m.error_code not in ("0x1", 1)
                     or m.receive_sequence <= 0

@@ -2,6 +2,7 @@
 
 import time
 from dataclasses import replace
+from itertools import pairwise
 from typing import Any
 
 import numpy as np
@@ -9,7 +10,7 @@ import pytest
 
 from i2rt.motor_drivers import dm_driver
 from i2rt.motor_drivers.utils import FeedbackFrameInfo
-from i2rt.robots.get_robot import create_yam_motor_chain, resolve_yam_robot
+from i2rt.robots.get_robot import create_yam_motor_chain, reconcile_guarded_gripper_limits, resolve_yam_robot
 from i2rt.robots.joint_reference import AdmittedReference, JointReference
 from i2rt.robots.utils import GripperType
 
@@ -127,6 +128,75 @@ def test_actual_factory_native_controller_and_sender_keep_reviewed_coordinates(
             chain.disable_motors()
             chain.close()
     assert io.closed
+
+
+@pytest.mark.parametrize(
+    ("feedback_position", "expected_branch"),
+    ((-4.463454642557, 0), (1.819829098955, 1)),
+)
+def test_guarded_factory_reconciles_saved_gripper_branch_before_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+    feedback_position: float,
+    expected_branch: int,
+) -> None:
+    calibration = np.array([0.2550164034485398, -4.993705653467613])
+    resolved = resolve_yam_robot(
+        gripper_type=GripperType.LINEAR_4310_STOCK,
+        gripper_limits_override=calibration,
+    )
+    positions = np.array([0, 1.88, 1.26, 0, 0, 0.1, feedback_position])
+    io = FakePhysicalExchange(positions)
+    monkeypatch.setattr(dm_driver, "DMSingleMotorCanInterface", lambda **_kwargs: io)
+    chain = create_yam_motor_chain(resolved, "fake", guarded_startup=True)
+    robot = None
+    try:
+        reconciled = reconcile_guarded_gripper_limits(
+            resolved,
+            chain,
+            endpoint_tolerance_rad=0.0006,
+        )
+        record = reconciled.gripper_limit_reconciliation
+        assert record is not None and record.branch_index == expected_branch
+        np.testing.assert_array_equal(resolved.robot_kwargs["gripper_limits"], calibration)
+        np.testing.assert_allclose(
+            reconciled.robot_kwargs["gripper_limits"],
+            calibration + expected_branch * 2 * np.pi,
+        )
+        assert len(record.feedback_positions_rad) == 3
+        assert all(second > first for first, second in pairwise(record.feedback_receive_sequences))
+        assert len(io.commands) == 14
+        assert all(command["kp"] == command["kd"] == command["torque"] == 0 for command in io.commands)
+
+        robot = reconciled.construct(chain, start_server_thread=False, use_gravity_comp=True)
+        expected_aperture = (feedback_position - record.effective_limits_rad[0]) / (
+            record.effective_limits_rad[1] - record.effective_limits_rad[0]
+        )
+        assert robot.get_joint_pos()[6] == pytest.approx(expected_aperture)
+        assert robot.get_robot_info()["gripper_limit_reconciliation"]["branch_index"] == expected_branch
+        assert robot.native_execution_status()["gripper_limit_reconciliation"]["branch_index"] == expected_branch
+    finally:
+        if robot is not None:
+            robot.disable_motors()
+            robot.close()
+        elif chain.running:
+            chain.disable_motors()
+            chain.close()
+
+
+def test_guarded_gripper_branch_refusal_disables_and_closes_chain(monkeypatch: pytest.MonkeyPatch) -> None:
+    resolved = resolve_yam_robot(
+        gripper_type=GripperType.LINEAR_4310_STOCK,
+        gripper_limits_override=np.array([0.2550164034485398, -4.993705653467613]),
+    )
+    io = FakePhysicalExchange(np.array([0, 1.88, 1.26, 0, 0, 0.1, 0.75]))
+    monkeypatch.setattr(dm_driver, "DMSingleMotorCanInterface", lambda **_kwargs: io)
+    chain = create_yam_motor_chain(resolved, "fake", guarded_startup=True)
+
+    with pytest.raises(RuntimeError, match="no unique representable startup branch"):
+        reconcile_guarded_gripper_limits(resolved, chain, endpoint_tolerance_rad=0.0006)
+
+    assert io.disabled == list(range(1, 8))
+    assert io.closed and not chain.running
 
 
 @pytest.mark.parametrize("failed_motor", range(1, 8))

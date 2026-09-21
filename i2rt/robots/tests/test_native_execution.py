@@ -306,3 +306,37 @@ def test_future_reference_waits_for_origin_and_braking_discards_it(monkeypatch: 
         assert robot.native_execution_status()["braking_sequence"] == (1 if cancel else -1)
     finally:
         robot.close()
+
+
+def test_reference_handoff_uses_time_after_feedback_read(monkeypatch: Any) -> None:
+    robot, chain = robot_fixture()
+    try:
+        base = time.monotonic()
+        clock = [base]
+        monkeypatch.setattr("i2rt.robots.motor_chain_robot.time.monotonic", lambda: clock[0])
+        robot.use_gravity_comp = True
+        robot._compute_gravity_compensation = lambda _state: np.zeros(7)
+
+        first = stationary_packet(horizon=0.02)
+        robot.command_joint_reference(first, gravity_idle=True)
+        successor = replace(first, sequence=2, origin=first.brake_at, brake_at=first.brake_at + 0.02)
+        robot.command_joint_reference(successor, gravity_idle=True)
+
+        clock[0] = successor.origin - 0.001
+
+        def cross_handoff_during_feedback_read() -> list[MotorInfo]:
+            clock[0] = successor.origin + 0.001
+            chain.states = [replace(motor, received_monotonic=clock[0]) for motor in chain.states]
+            return chain.states
+
+        chain.read_states = cross_handoff_during_feedback_read
+        robot.update()
+
+        status = robot.native_execution_status()
+        assert status["active_reference_sequence"] == 2
+        assert status["pending_reference_sequence"] is None
+        assert status["reference_sample"]["sequence"] == 2
+        assert status["reference_sample"]["gravity_idle"]
+        np.testing.assert_array_equal(status["reference_sample"]["kp_raw_motor"][:6], np.zeros(6))
+    finally:
+        robot.close()
