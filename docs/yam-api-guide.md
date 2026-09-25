@@ -56,6 +56,13 @@ uses a staged path alongside the legacy `get_yam_robot` examples below:
   to the outer session, not this call. `native_execution_status` exposes publication, feedback, limiter and fault
   evidence. `disable_motors` attempts explicit individual disables and returns their acknowledgement outcomes.
   `close()` still does not substitute for supported disable.
+- Guarded deployment passes an explicit `GripperEffortPolicy`. Its closing/opening force values are converted by
+  the selected mechanism map; threshold feedback latches the last effective J7 command in public aperture
+  direction. Opposite intent is released only when the outer scalar owner activates a fresh bounded continuation.
+  `native_execution_status` reports this as contact limiting, never as proof of a grasp.
+- `NativeFeedbackLimits` separates report-only operating effort from a higher hard motor-effort ceiling and gives
+  travel, hard-effort, and temperature their own persistence. The first causal native fault is immutable and
+  includes the affected motor/value/limit; later closed-executor refusals are consequences.
 
 The outer force-driven `mujoco-actuation` chain consumes these same native commands; it is not `SimRobot`.
 PD-only supplies zero additive torque, without disabling physical/world gravity. Native feedback guards,
@@ -265,7 +272,8 @@ Do not use this as a portable real/sim API in v1.2.4. `SimRobot` returns `{"pos"
 
 On real hardware this reports arm/gripper type, `kp`, `kd`, gravity-idle damping, Coulomb-friction values, joint
 limits, gripper raw limits, gravity multipliers, gripper index, force limit, and auto-recovery setting. In
-simulation it reports only joint/gripper limits, gripper index, simulation flag, and gravity multiplier.
+simulation it reports only joint/gripper limits, gripper index, simulation flag, and gravity multiplier. A real
+robot with the directional limiter also reports its selected gripper-effort policy.
 
 Treat this dictionary as implementation metadata, not a stable serialization schema. Copy arrays before changing
 them; use `update_kp_kd(...)` to update real gains.
@@ -388,11 +396,17 @@ direction. Calibration is open-loop torque motion against mechanical stops; keep
 
 ### Force limiter
 
-For a factory-created motorized gripper, the software force limit is 50 N. The limiter detects high average motor
-effort combined with low speed, converts the force request to a target motor torque using either a linear or crank
-mechanism model, and relaxes the position setpoint to approximate that torque through `kp`. This is a model-based
-motor limit, not closed-loop fingertip-force sensing. Contact geometry, friction, linkage error, and object
-compliance affect the actual grasp force.
+The legacy factory retains its 50 N setting. Guarded deployment instead supplies assembly-qualified closing and
+opening force thresholds. The limiter maps the applicable force to raw motor torque using the selected linear or
+crank transmission. When fresh effort crosses that threshold while aperture intent advances, it fixes the last
+effective J7 position command actually sent and commands zero target velocity. Further intent in that public
+opening/closing direction cannot ratchet the command through a load.
+
+Opposite public-aperture intent requests release without requiring torque to fall. Guarded release remains fixed
+until the existing scalar trajectory owner activates a measured-state bounded continuation; pre-release effort
+history is then cleared and residual effort cannot immediately re-latch the relieving motion. A later reversal can
+latch again. This is task-agnostic motor-effort limiting—not fingertip force feedback, contact localization, or
+grasp detection. Contact geometry, friction, linkage error, and object compliance still affect actual force.
 
 ## 8. Kinematics and model composition
 

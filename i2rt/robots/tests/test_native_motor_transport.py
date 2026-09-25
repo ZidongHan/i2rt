@@ -3,6 +3,7 @@
 import inspect
 import threading
 import time
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
 
@@ -27,6 +28,8 @@ def fake_chain() -> DMChainCanInterface:
     chain._guarded_startup = False
     chain.start_thread_flag = False
     chain._sender_fault = None
+    chain._requested_stop = threading.Event()
+    chain.enable_auto_recovery = False
     chain._command_id = 3
     chain._feedback_command_id = 2
     chain._sweep_id = 4
@@ -116,6 +119,25 @@ def test_disable_reports_partial_failure_and_does_not_call_enable() -> None:
     assert result[0]["confirmed"]
     assert result[1]["attempted"] and not result[1]["confirmed"]
     assert "no response" in result[1]["error"]
+
+
+def test_requested_sender_stop_is_quiet_but_unexpected_failure_is_retained(capsys: Any) -> None:
+    chain = fake_chain()
+    chain._guarded_startup = True
+    chain._rate_recorder = nullcontext()
+    chain._report_interval = 10.0
+    chain.commands = []
+    chain._set_commands = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("sender interrupted"))
+    chain._requested_stop.set()
+    chain._set_torques_and_update_state()
+    assert chain._sender_fault is None
+    assert "DM Error" not in capsys.readouterr().out
+
+    chain.running = True
+    chain._requested_stop.clear()
+    chain._set_torques_and_update_state()
+    assert chain._sender_fault == "sender interrupted"
+    assert "DM Error in control loop: sender interrupted" in capsys.readouterr().out
 
 
 def test_motor_off_uses_native_packet_and_returns_status_without_fault_clear() -> None:

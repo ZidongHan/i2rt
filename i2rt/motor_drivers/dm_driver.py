@@ -451,6 +451,7 @@ class DMChainCanInterface(MotorChain):
         self.command_lock = threading.RLock()
         self.transport_lock = threading.Lock()
         self._sender_fault: Optional[str] = None
+        self._requested_stop = threading.Event()
         self._receive_sequence = 0
         self._sweep_id = 0
         self._sweep_started_monotonic = 0.0
@@ -578,6 +579,7 @@ class DMChainCanInterface(MotorChain):
         ):
             raise RuntimeError("guarded sender requires an installed, unexpired complete native command")
         logging.info("starting separate thread for control loop")
+        self._requested_stop.clear()
         self._sender_thread = threading.Thread(target=self._set_torques_and_update_state)
         self._sender_thread.start()
         self.start_thread_flag = True
@@ -675,6 +677,9 @@ class DMChainCanInterface(MotorChain):
                     time.sleep(0.0005)  # yield GIL so other threads can acquire locks
                     self._rate_recorder.track()
                 except Exception as e:
+                    if getattr(self, "_requested_stop", None) is not None and self._requested_stop.is_set():
+                        self.running = False
+                        return
                     print(f"DM Error in control loop: {e}")
                     self.running = False
                     self._sender_fault = str(e)
@@ -876,6 +881,9 @@ class DMChainCanInterface(MotorChain):
             return self.same_bus_device_states
 
     def close(self) -> None:
+        requested_stop = getattr(self, "_requested_stop", None)
+        if requested_stop is not None:
+            requested_stop.set()
         self.running = False
         sender = getattr(self, "_sender_thread", None)
         if sender is not None and sender is not threading.current_thread():
@@ -888,6 +896,9 @@ class DMChainCanInterface(MotorChain):
         Never re-enable or clear faults. Caller owns support confirmation for a
         normal shutdown; an urgent request may call this directly.
         """
+        requested_stop = getattr(self, "_requested_stop", None)
+        if requested_stop is not None:
+            requested_stop.set()
         self.running = False
         results = []
         lock = getattr(self, "transport_lock", self.command_lock)

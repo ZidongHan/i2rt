@@ -22,6 +22,7 @@ from i2rt.robots.motor_chain_robot import MotorChainRobot
 from i2rt.robots.robot import Robot
 from i2rt.robots.utils import (
     ArmType,
+    GripperEffortPolicy,
     GripperType,
     _load_arm_config,
     combine_arm_and_gripper_xml,
@@ -214,6 +215,7 @@ def resolve_yam_robot(
     gripper_limits_override: Optional[np.ndarray] = None,
     gripper_kp: Optional[float] = None,
     gripper_kd: Optional[float] = None,
+    gripper_effort_policy: GripperEffortPolicy | None = None,
 ) -> ResolvedYamRobot:
     """Resolve model, mappings and native defaults without motor discovery or enable."""
     if arm_type == ArmType.NO_ARM:
@@ -307,6 +309,7 @@ def resolve_yam_robot(
             gripper_type=gripper_type,
             arm_type=arm_type,
             limit_gripper_force=50.0,
+            gripper_effort_policy=gripper_effort_policy,
         )
     return ResolvedYamRobot(motor_list, motor_offsets, directions, kwargs, sim_joint_limits, with_teaching_handle)
 
