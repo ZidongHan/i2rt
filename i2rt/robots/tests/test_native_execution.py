@@ -11,6 +11,7 @@ import pytest
 from i2rt.motor_drivers.utils import MotorInfo
 from i2rt.robots.joint_reference import AdmittedReference, JerkPiece, JointReference, _same_state
 from i2rt.robots.motor_chain_robot import MotorChainRobot, NativeFeedbackLimits
+from i2rt.robots.utils import ArmType, GripperEffortPolicy, GripperForceLimiter, GripperType
 
 
 class FakeChain:
@@ -50,7 +51,7 @@ class FakeChain:
         self.running = False
 
 
-def robot_fixture() -> tuple[MotorChainRobot, FakeChain]:
+def robot_fixture(*, gripper_effort_policy: GripperEffortPolicy | None = None) -> tuple[MotorChainRobot, FakeChain]:
     chain = FakeChain()
     robot = MotorChainRobot(
         chain,
@@ -60,6 +61,7 @@ def robot_fixture() -> tuple[MotorChainRobot, FakeChain]:
         kd=[5, 5, 5, 1.5, 1.5, 1.5, 0.5],
         gripper_index=6,
         gripper_limits=np.array([0.0, -2.0]),
+        gripper_effort_policy=gripper_effort_policy,
         start_server_thread=False,
     )
     # Constructor's compatibility wait is not receipt progress. Refresh explicitly.
@@ -71,6 +73,20 @@ def stationary_packet(sequence: int = 1, horizon: float = 0.02) -> AdmittedRefer
     reference = JointReference(tuple(() for _ in range(7)), (0, 0, 0, 0, 0, 0, 0.5))
     now = time.monotonic()
     return AdmittedReference(sequence, now, now + horizon, reference, reference, (0.05,) * 7, (0.2,) * 7)
+
+
+def native_feedback_limits(**overrides: Any) -> NativeFeedbackLimits:
+    values = {
+        "position": ((-3, 3),) * 6 + ((0, 1),),
+        "position_noise": (0.001,) * 7,
+        "velocity": (3.0,) * 7,
+        "operating_motor_effort_nm": (10.0,) * 7,
+        "hard_motor_effort_nm": (20.0,) * 7,
+        "temperature_c": (80.0,) * 7,
+        "maximum_sweep_skew_s": 0.01,
+    }
+    values.update(overrides)
+    return NativeFeedbackLimits(**values)
 
 
 def test_scalar_reference_continuity_keeps_numpy_tolerance() -> None:
@@ -95,6 +111,155 @@ def test_reference_jerk_reports_actual_piece_and_fallback_clock() -> None:
         reference.jerk_at(float("nan"))
 
 
+def _limiter_state(*, target: float, current: float = 0.5, effort: float = 0.2) -> dict[str, float]:
+    # Raw endpoints are deliberately reversed relative to normalized aperture.
+    return {
+        "target_qpos": -2.0 * target,
+        "current_qpos": -2.0 * current,
+        "current_qvel": 0.0,
+        "current_eff": effort,
+        "current_normalized_qpos": current,
+        "target_normalized_qpos": target,
+        "last_command_qpos": -0.9,
+        "last_command_normalized_qpos": 0.45,
+    }
+
+
+def test_bidirectional_effort_latch_uses_public_direction_and_last_effective_command() -> None:
+    policy = GripperEffortPolicy(10.0, 10.0, 0.01)
+    limiter = GripperForceLimiter(50.0, GripperType.LINEAR_4310, ArmType.YAM, 20.0, policy)
+    limiter.defer_release = True
+
+    assert limiter.update(_limiter_state(target=0.2)) == pytest.approx(-0.9)
+    status = limiter.status()
+    assert status["state"] == "effort_latched_closing"
+    assert status["blocked_direction"] == "closing"
+    assert status["latched_public_qpos"] == pytest.approx(0.45)
+
+    # Continued closure cannot ratchet the retained command through the load.
+    assert limiter.update({**_limiter_state(target=0.1), "last_command_qpos": -1.2}) == pytest.approx(-0.9)
+    # Opposite intent requests a bounded release; torque is not consulted.
+    assert limiter.update(_limiter_state(target=0.8, effort=2.0)) == pytest.approx(-0.9)
+    assert limiter.status()["state"] == "release_pending"
+    limiter.acknowledge_release()
+    assert limiter.update(_limiter_state(target=0.8, effort=2.0)) == pytest.approx(-1.6)
+    assert not limiter.status()["contact_limited"]
+    # A later reversal re-arms the limiter and may latch in the original direction.
+    assert limiter.update(_limiter_state(target=0.2, effort=2.0)) == pytest.approx(-0.9)
+    assert limiter.status()["blocked_direction"] == "closing"
+
+    opening = GripperForceLimiter(50.0, GripperType.LINEAR_4310, ArmType.YAM, 20.0, policy)
+    assert opening.update(_limiter_state(target=0.8)) == pytest.approx(-0.9)
+    assert opening.status()["state"] == "effort_latched_opening"
+
+
+def test_below_threshold_gripper_effort_preserves_target() -> None:
+    limiter = GripperForceLimiter(
+        50.0,
+        GripperType.LINEAR_4310,
+        ArmType.YAM,
+        20.0,
+        GripperEffortPolicy(10.0, 10.0, 0.01),
+    )
+    assert limiter.update(_limiter_state(target=0.2, effort=0.1)) == pytest.approx(-0.4)
+    assert limiter.status()["state"] == "normal"
+
+
+def test_legacy_factory_limiter_retains_speed_gated_force_adjustment() -> None:
+    limiter = GripperForceLimiter(50.0, GripperType.LINEAR_4310, ArmType.YAM, 20.0)
+    state = _limiter_state(target=0.2, effort=0.6)
+    limited = limiter.update(state)
+    assert limiter.status()["state"] == "legacy_force_limited"
+    assert limited != pytest.approx(state["last_command_qpos"])
+    assert limited != pytest.approx(state["target_qpos"])
+
+
+def test_gripper_contact_is_latched_before_next_send_without_arm_fault() -> None:
+    robot, chain = robot_fixture(gripper_effort_policy=GripperEffortPolicy(10.0, 10.0, 0.01))
+    robot._feedback_limits = native_feedback_limits(
+        operating_motor_effort_nm=(10.0,) * 6 + (4.0,),
+        hard_motor_effort_nm=(20.0,) * 6 + (6.0,),
+    )
+    try:
+        packet = stationary_packet(horizon=1)
+        packet = replace(
+            packet,
+            nominal=JointReference(tuple(() for _ in range(7)), (0, 0, 0, 0, 0, 0, 0.2)),
+            brake=JointReference(tuple(() for _ in range(7)), (0, 0, 0, 0, 0, 0, 0.2)),
+        )
+        chain.states[6] = replace(chain.states[6], eff=0.2)
+        robot.command_joint_reference(packet)
+        robot.update()
+        status = robot.native_execution_status()
+        assert status["fault"] is None
+        assert status["gripper_limited"]
+        assert status["gripper_effort_limiter"]["blocked_direction"] == "closing"
+        assert chain.commands[-1][1]["pos"][6] == pytest.approx(-1.0)
+        assert chain.commands[-1][1]["vel"][6] == 0.0
+    finally:
+        robot.close()
+
+
+def test_operating_effort_is_report_only_but_hard_effort_retains_first_fault() -> None:
+    robot, chain = robot_fixture()
+    robot._feedback_limits = native_feedback_limits(
+        operating_motor_effort_nm=(14.0,) * 7,
+        hard_motor_effort_nm=(25.0,) * 7,
+    )
+    try:
+        robot.command_joint_reference(stationary_packet(horizon=1))
+        chain.states[1] = replace(chain.states[1], eff=-14.174359)
+        robot.update()
+        status = robot.native_execution_status()
+        assert status["fault"] is None
+        assert status["effort_assessment"]["operating_exceeded"][0]["motor_id"] == 2
+
+        chain.states[1] = replace(chain.states[1], eff=-25.1, received_monotonic=time.monotonic())
+        with pytest.raises(RuntimeError, match="hard raw motor effort"):
+            robot.update()
+        first = robot.native_execution_status()
+        with pytest.raises(RuntimeError, match="faulted/closed"):
+            robot.command_joint_reference(stationary_packet(2))
+        final = robot.native_execution_status()
+        assert final["fault"] == first["fault"]
+        assert final["fault_details"]["motor_id"] == 2
+        assert final["fault_details"]["observed_value"] == pytest.approx(-25.1)
+        assert "faulted/closed native execution" in final["fault_consequences"][0]
+    finally:
+        robot.close()
+
+
+def test_aperture_decoder_fringe_uses_slack_and_material_travel_uses_persistence() -> None:
+    robot, chain = robot_fixture()
+    robot._feedback_limits = native_feedback_limits(
+        position_noise=(0.001,) * 7,
+        hard_motor_effort_nm=(30.0,) * 7,
+        travel_persistence_s=0.01,
+    )
+    packet = stationary_packet(horizon=1)
+    zero_aperture = JointReference(tuple(() for _ in range(7)), (0, 0, 0, 0, 0, 0, 0.0))
+    packet = replace(packet, nominal=zero_aperture, brake=zero_aperture)
+    try:
+        robot.command_joint_reference(packet)
+        # Raw +0.001 maps to normalized -0.0005 through [0,-2]: legal decoder fringe.
+        chain.states[6] = replace(chain.states[6], pos=0.001)
+        robot.update()
+        assert robot.native_execution_status()["fault"] is None
+
+        # Raw +0.003 maps to -0.0015: outside slack, but not a one-sweep fault.
+        chain.states[6] = replace(chain.states[6], pos=0.003, received_monotonic=time.monotonic())
+        robot.update()
+        time.sleep(0.012)
+        chain.states = [replace(motor, received_monotonic=time.monotonic()) for motor in chain.states]
+        with pytest.raises(RuntimeError, match="public joint travel"):
+            robot.update()
+        details = robot.native_execution_status()["fault_details"]
+        assert details["motor_id"] == 7
+        assert details["persistence_duration_s"] >= 0.01
+    finally:
+        robot.close()
+
+
 @pytest.mark.parametrize(
     ("change", "match"),
     [
@@ -103,15 +268,13 @@ def test_reference_jerk_reports_actual_piece_and_fallback_clock() -> None:
         ({"temp_mos": 81.0}, "temperature"),
         ({"temp_mos": -1.0}, "unavailable"),
         ({"temp_rotor": float("nan")}, "nonfinite"),
-        ({"vel": 4.0}, "joint velocity"),
+        ({"vel": 4.0}, "joint velocity decoder sanity"),
         ({"sweep_id": 99}, "incoherent"),
     ],
 )
 def test_native_installation_health_checks_precede_actuation(change: dict, match: str) -> None:
     robot, chain = robot_fixture()
-    robot._feedback_limits = NativeFeedbackLimits(
-        ((-3, 3),) * 6 + ((0, 1),), (0.001,) * 7, (3.0,) * 7, (20.0,) * 7, (80.0,) * 7, 0.01
-    )
+    robot._feedback_limits = native_feedback_limits()
     try:
         chain.states[0] = replace(chain.states[0], **change)
         robot.command_joint_reference(stationary_packet())
@@ -125,9 +288,7 @@ def test_native_installation_health_checks_precede_actuation(change: dict, match
 
 def test_native_health_persistence_is_not_extended_by_cache_polling() -> None:
     robot, chain = robot_fixture()
-    robot._feedback_limits = NativeFeedbackLimits(
-        ((-3, 3),) * 6 + ((0, 1),), (0.001,) * 7, (3.0,) * 7, (20.0,) * 7, (80.0,) * 7, 0.01, 0.01
-    )
+    robot._feedback_limits = native_feedback_limits(temperature_persistence_s=0.01)
     try:
         chain.states[0] = replace(chain.states[0], temp_rotor=90)
         robot.command_joint_reference(stationary_packet(horizon=1))
@@ -189,6 +350,10 @@ def test_limiter_release_occurs_at_native_reference_activation_not_publication()
         limiter.release_pending = False
 
     limiter.acknowledge_release = acknowledge
+    limiter.status = lambda: {
+        "release_pending": limiter.release_pending,
+        "contact_limited": limiter._is_clogged,
+    }
     robot._gripper_force_limiter = limiter
     try:
         robot.command_joint_reference(stationary_packet(horizon=1))
@@ -304,5 +469,39 @@ def test_future_reference_waits_for_origin_and_braking_discards_it(monkeypatch: 
         assert robot.native_execution_status()["active_reference_sequence"] == (1 if cancel else 2)
         assert robot.native_execution_status()["pending_reference_sequence"] is None
         assert robot.native_execution_status()["braking_sequence"] == (1 if cancel else -1)
+    finally:
+        robot.close()
+
+
+def test_reference_handoff_uses_time_after_feedback_read(monkeypatch: Any) -> None:
+    robot, chain = robot_fixture()
+    try:
+        base = time.monotonic()
+        clock = [base]
+        monkeypatch.setattr("i2rt.robots.motor_chain_robot.time.monotonic", lambda: clock[0])
+        robot.use_gravity_comp = True
+        robot._compute_gravity_compensation = lambda _state: np.zeros(7)
+
+        first = stationary_packet(horizon=0.02)
+        robot.command_joint_reference(first, gravity_idle=True)
+        successor = replace(first, sequence=2, origin=first.brake_at, brake_at=first.brake_at + 0.02)
+        robot.command_joint_reference(successor, gravity_idle=True)
+
+        clock[0] = successor.origin - 0.001
+
+        def cross_handoff_during_feedback_read() -> list[MotorInfo]:
+            clock[0] = successor.origin + 0.001
+            chain.states = [replace(motor, received_monotonic=clock[0]) for motor in chain.states]
+            return chain.states
+
+        chain.read_states = cross_handoff_during_feedback_read
+        robot.update()
+
+        status = robot.native_execution_status()
+        assert status["active_reference_sequence"] == 2
+        assert status["pending_reference_sequence"] is None
+        assert status["reference_sample"]["sequence"] == 2
+        assert status["reference_sample"]["gravity_idle"]
+        np.testing.assert_array_equal(status["reference_sample"]["kp_raw_motor"][:6], np.zeros(6))
     finally:
         robot.close()

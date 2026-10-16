@@ -18,13 +18,14 @@ clears startup faults. The guarded path uses these existing owners:
 
 | Stage | Guarded behavior |
 | --- | --- |
-| Resolution and discovery | Resolve without I/O; authorized discovery/enable with bounded transactions and no fault clearing; exact reviewed offsets and saved jaw endpoints |
+| Resolution and discovery | Resolve without I/O; authorized discovery/enable with bounded transactions and no fault clearing; exact reviewed offsets and calibration-aware selection of the saved jaw endpoints' current single-turn branch |
 | Initial command | Feedback-qualified measured position, velocity and derived acceleration → admitted brake → start native execution; no implicit teleport or stationary reset |
 | Nominal execution | Finite joint polynomials evaluated against monotonic time by `MotorChainRobot`; native MIT PD plus configured static gravity and optional native signed friction |
+| Scheduled handoff | Recheck a pending reference after feedback acquisition against the actual evaluation time; never evaluate an expired predecessor merely because the update began before the successor origin |
 | Loss of new intent | The admitted brake retains its original deadline; producer and updater/sender lifetimes cannot be refreshed by a stale repeated command |
 | Feedback | Genuine receive sequence/time/status, measured q/qd/effort and available temperatures; disabled or stale feedback does not become a healthy command rejection |
-| Jaw obstruction | Existing raw-motor effort/speed limiter; measured scalar replan and activation acknowledgement on release; no arm-history rewind of aperture |
-| Shutdown | Explicit per-motor disable acknowledgements, including unknown outcomes; then transport cleanup. No firmware timeout change or automatic re-enable |
+| Jaw obstruction | Directional public-aperture effort latch at the last effective command; measured scalar replan and activation acknowledgement on opposite-intent release; no arm-history rewind of aperture |
+| Shutdown | Requested sender stop is distinct from sender failure; explicit per-motor disable acknowledgements, including unknown outcomes, precede transport cleanup. No firmware timeout change or automatic re-enable |
 
 `joint_reference.py` is immutable execution data, not another IK solver. The outer session owns preparation,
 admission, observed arrival, terminal controls and recording. Restricted jaw-only endpoint search uses the
@@ -228,6 +229,14 @@ The motor-specific numeric ranges are used again to dequantize position, velocit
 3. multiplies velocity and torque feedback by `direction`; and
 4. maps gripper position/velocity from raw angle to normalized public coordinates.
 
+For guarded deployment with saved gripper calibration, the raw chain is deliberately available before step 4's
+`JointMapper` is constructed. The startup owner combines the retained enable response with two progressing
+zero-gain/zero-effort feedback sweeps and finds the unique integer-period shift whose complete saved endpoint
+interval is representable by the motor and contains every observed J7 position within the installation-derived
+endpoint tolerance. A refusal disables and closes the chain. Success changes only the session's effective
+`[closed, open]` endpoints; endpoint difference, velocity scaling, firmware zero and the permanent calibration
+remain unchanged. The ordinary 25-rad MIT packet unwrap does not perform this output-revolution reconciliation.
+
 No gear-ratio conversion appears in this host path. The code assumes the decoded position already has the joint
 coordinate convention expected by the model, apart from sign/offset and gripper normalization.
 
@@ -288,7 +297,8 @@ field.
    `JointCommands`.
 4. The robot thread calculates `g(q)` from MuJoCo and optional signed friction, then forms
    `tau_ff = 0 + gravity_factor * g(q) + friction`.
-5. The gripper force limiter may replace the raw gripper position target; raw endpoints are clipped.
+5. The gripper effort limiter may replace the raw gripper position target with its retained last-effective command;
+   raw endpoints are clipped and a contact-limited target has zero commanded velocity.
 6. `DMChainCanInterface.set_commands` publishes the command to the motor thread.
 7. The motor thread applies direction and offset, packs `position`, zero `velocity`, `kp`, `kd`, and `tau_ff`, then
    sends an MIT frame to every motor.
@@ -396,11 +406,26 @@ while the i2RT host decides when motion has stopped.
 
 ### Force limiting
 
-The robot thread examines a 0.1 s buffer of decoded gripper effort and current speed. Once high effort and low
-speed indicate blockage, it converts the configured 50 N limit into motor torque using a mechanism model, then
-backs out a position target expected to produce that torque through gripper `kp`. The DAMIAO motor still receives
-an ordinary MIT position command. There is no direct force-control command and no fingertip force sensor in this
-path.
+The legacy factory maps its configured 50 N force through the selected mechanism. A guarded deployment supplies
+separate assembly-qualified opening/closing forces, release deadband, and latch persistence. On each fresh sweep,
+the limiter derives the applicable raw torque threshold from normalized public aperture direction. A threshold
+crossing retains the previous cycle's effective raw/public J7 command; it does not chase measured position or
+construct another trajectory. The DAMIAO motor still receives an ordinary MIT position command with zero target
+velocity while limited.
+
+Opposite normalized intent sets `release_pending`. The latch remains active until `release_gripper` is activated
+with a fresh measured-state scalar continuation; acknowledgement clears historical effort and inhibits immediate
+re-latching while the command relieves the blocked direction. `native_execution_status()` exposes state,
+direction, latch command, effort, derived threshold, transition, and release reason. None is a force-sensor or
+successful-grasp claim.
+
+The guarded feedback owner evaluates integrity, travel, decoder-domain velocity, effort, and temperature before
+the next send. Operating effort is report-only; qualified hard effort, travel, and temperature use separate
+persistence. It also records the exact MIT demand estimate
+`feedforward + kp*(q_ref-q) + kd*(qd_ref-qd)`. A hard observation or estimated-demand breach stores the first
+causal fault with motor, value, limit, sweep, reference, and duration. Later shutdown/refusal messages cannot
+replace it. Deliberately stopping the guarded sender for disable/close exits quietly; expiry, CAN, partial-reply,
+or motor-status errors still populate `_sender_fault`.
 
 ## 10. Model and kinematics APIs
 

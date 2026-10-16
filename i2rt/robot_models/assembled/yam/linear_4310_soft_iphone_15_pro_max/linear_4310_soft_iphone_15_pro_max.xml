@@ -86,9 +86,9 @@
                         <geom name="iphone_15_pro_max_visual_0" type="mesh" mesh="mesh_ed3c9778da0b" pos="0 0 0" quat="1 0 0 0" contype="0" conaffinity="0" group="2" rgba="0.5 0.5 0.5 1" />
                       </body>
                     </body>
-                    <site name="iphone_wide_camera_site" pos="-0.034299999999999997 0 -0.01" quat="0.99405633822231965 0 0.10886687485196457 0" size="0.005" rgba="0 0.4 1 1" group="4" />
+                    <site name="iphone_wide_camera_site" pos="-0.034299999999999997 0 -0.01" quat="0.4425947316851776 -0.55146160653714205 0.55146160653714216 -0.44259473168517754" size="0.005" rgba="0 0.4 1 1" group="4" />
                   </body>
-                  <site name="grasp_site" pos="0 0 -0.19370000000000001" quat="0 1 0 0" size="0.005" rgba="0 1 0 1" group="4" />
+                  <site name="grasp_site" pos="0 0 -0.19370000000000001" quat="0 0.70710678118654757 0.70710678118654757 0" size="0.005" rgba="0 1 0 1" group="4" />
                 </body>
               </body>
             </body>

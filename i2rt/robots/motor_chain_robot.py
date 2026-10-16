@@ -17,7 +17,14 @@ from i2rt.motor_drivers.dm_driver import (
 from i2rt.robots.joint_reference import AdmittedReference
 from i2rt.robots.model_coordinates import ModelCoordinateAdapter
 from i2rt.robots.robot import Robot
-from i2rt.robots.utils import ArmType, GripperForceLimiter, GripperType, JointMapper, detect_gripper_limits
+from i2rt.robots.utils import (
+    ArmType,
+    GripperEffortPolicy,
+    GripperForceLimiter,
+    GripperType,
+    JointMapper,
+    detect_gripper_limits,
+)
 from i2rt.utils.mujoco_utils import MuJoCoKDL
 from i2rt.utils.recording import RobotMcapRecorder
 
@@ -65,15 +72,23 @@ class JointCommands:
 
 @dataclass(frozen=True)
 class NativeFeedbackLimits:
-    """Optional installation-qualified public travel and raw-motor health bounds."""
+    """Installation-qualified public travel and raw-motor health bounds.
+
+    Operating effort is diagnostic. Hard effort, temperature, and material
+    travel excursions are faults only after their category-specific persistence.
+    Feedback integrity and impossible decoded velocity remain immediate.
+    """
 
     position: Tuple[Tuple[float, float], ...]
     position_noise: Tuple[float, ...]
     velocity: Tuple[float, ...]
-    motor_effort_nm: Tuple[float, ...]
+    operating_motor_effort_nm: Tuple[float, ...]
+    hard_motor_effort_nm: Tuple[float, ...]
     temperature_c: Tuple[float, ...]
     maximum_sweep_skew_s: float
-    persistence_s: float = 0.0
+    travel_persistence_s: float = 0.0
+    hard_effort_persistence_s: float = 0.0
+    temperature_persistence_s: float = 0.0
 
     def validate(self, size: int) -> None:
         position = np.asarray(self.position)
@@ -83,14 +98,24 @@ class NativeFeedbackLimits:
             or np.any(position[:, 0] >= position[:, 1])
         ):
             raise ValueError("native feedback position bounds must be finite ordered public pairs")
-        for name in ("position_noise", "velocity", "motor_effort_nm", "temperature_c"):
+        for name in (
+            "position_noise",
+            "velocity",
+            "operating_motor_effort_nm",
+            "hard_motor_effort_nm",
+            "temperature_c",
+        ):
             value = np.asarray(getattr(self, name))
             if value.shape != (size,) or not np.all(np.isfinite(value)) or np.any(value <= 0):
                 raise ValueError(f"native feedback {name} must contain positive finite per-motor bounds")
+        if np.any(np.asarray(self.operating_motor_effort_nm) >= np.asarray(self.hard_motor_effort_nm)):
+            raise ValueError("native operating effort must remain below the hard motor-effort ceiling")
         if not np.isfinite(self.maximum_sweep_skew_s) or self.maximum_sweep_skew_s <= 0:
             raise ValueError("native maximum_sweep_skew_s must be positive")
-        if not np.isfinite(self.persistence_s) or self.persistence_s < 0:
-            raise ValueError("native feedback persistence_s must be finite and nonnegative")
+        for name in ("travel_persistence_s", "hard_effort_persistence_s", "temperature_persistence_s"):
+            value = getattr(self, name)
+            if not np.isfinite(value) or value < 0:
+                raise ValueError(f"native feedback {name} must be finite and nonnegative")
 
 
 class MotorChainRobot(Robot):
@@ -115,6 +140,7 @@ class MotorChainRobot(Robot):
         model_coordinate_adapter: Optional[ModelCoordinateAdapter] = None,
         gripper_limits: Optional[np.ndarray] = None,  # [closed, open]
         limit_gripper_force: float = -1,  # whether to limit the gripper effort when it is blocked. -1 means no limit.
+        gripper_effort_policy: GripperEffortPolicy | None = None,
         clip_motor_torque: float = np.inf,  # clip the offset motor torque, real motor torque can still still be larger than this setting depending on the motor onboard PID loop
         gripper_type: GripperType = GripperType.LINEAR_4310,
         arm_type: ArmType = ArmType.YAM,
@@ -134,6 +160,7 @@ class MotorChainRobot(Robot):
         feedback_max_age_s: float = 0.05,
         native_command_lease_s: float = 0.03,
         feedback_limits: NativeFeedbackLimits | None = None,
+        gripper_limit_reconciliation: dict[str, Any] | None = None,
     ) -> None:
         # Set up CPU pinning and real-time scheduling if requested
         if pinned_cpu is not None and set_realtime_and_pin_callback is not None:
@@ -143,6 +170,7 @@ class MotorChainRobot(Robot):
         self._set_realtime_and_pin_callback = set_realtime_and_pin_callback
         self._arm_type = arm_type
         self._gripper_type = gripper_type
+        self._gripper_limit_reconciliation = copy.deepcopy(gripper_limit_reconciliation)
         self._model_coordinate_adapter = model_coordinate_adapter
         if model_coordinate_adapter is not None and len(model_coordinate_adapter.public_names) != len(motor_chain):
             raise ValueError(
@@ -182,6 +210,7 @@ class MotorChainRobot(Robot):
                 logger.info(f"Using provided gripper limits: {gripper_limits}")
 
         self._last_gripper_command_qpos = 1  # initialize as fully open
+        self._last_gripper_command_normalized_qpos = 1.0
         assert clip_motor_torque >= 0.0
         self._clip_motor_torque = clip_motor_torque
         self.motor_chain = motor_chain
@@ -201,12 +230,21 @@ class MotorChainRobot(Robot):
         self._gripper_force_limiter: Optional[GripperForceLimiter] = None
         self._limit_gripper_force: float = -1.0
 
-        if self._gripper_index is not None:
+        if self._gripper_index is not None and (limit_gripper_force > 0 or gripper_effort_policy is not None):
             self._gripper_force_limiter = GripperForceLimiter(
-                max_force=limit_gripper_force, gripper_type=gripper_type, arm_type=arm_type, kp=kp[gripper_index]
+                max_force=limit_gripper_force,
+                gripper_type=gripper_type,
+                arm_type=arm_type,
+                kp=kp[gripper_index],
+                effort_policy=gripper_effort_policy,
             )  # force in newton
-            self._limit_gripper_force = limit_gripper_force
+            self._limit_gripper_force = (
+                limit_gripper_force
+                if gripper_effort_policy is None
+                else max(gripper_effort_policy.closing_force_n, gripper_effort_policy.opening_force_n)
+            )
 
+        if self._gripper_index is not None:
             self.remapper = JointMapper(
                 index_range_map={gripper_index: gripper_limits},
                 total_dofs=len(motor_chain),
@@ -278,6 +316,10 @@ class MotorChainRobot(Robot):
         self._reference_braking_sequence = -1
         self._gripper_release_sequence = -1
         self._native_fault: Optional[str] = None
+        self._native_fault_details: Optional[Dict[str, Any]] = None
+        self._native_fault_consequences: List[str] = []
+        self._fault_lock = threading.Lock()
+        self._native_effort_assessment: Dict[str, Any] = {}
         self._native_update_generation = 0
         self._native_update_monotonic = 0.0
         self._native_reference_sample: Optional[Dict[str, Any]] = None
@@ -304,6 +346,7 @@ class MotorChainRobot(Robot):
             self._last_gripper_command_qpos = self.remapper.to_robot_joint_pos_space(self._joint_state.pos)[
                 self._gripper_index
             ]
+            self._last_gripper_command_normalized_qpos = float(self._joint_state.pos[self._gripper_index])
         self._commands = JointCommands.init_all_zero(len(motor_chain))
         if zero_gravity_mode:
             self._commands.kd = self._grav_comp_kd.copy()
@@ -353,7 +396,10 @@ class MotorChainRobot(Robot):
             raise ValueError("PD-only guarded execution cannot include Coulomb feedforward")
         with self._command_lock:
             if self._native_fault is not None or self._stop_event.is_set():
-                raise RuntimeError("faulted/closed native execution cannot accept references")
+                error = RuntimeError("faulted/closed native execution cannot accept references")
+                if self._native_fault is not None:
+                    self._record_native_fault(error)
+                raise error
             latest = self._pending_reference[0] if self._pending_reference else self._reference
             if latest is not None and reference.sequence <= latest.sequence:
                 raise ValueError("native reference sequence must advance")
@@ -369,8 +415,11 @@ class MotorChainRobot(Robot):
                 self._gripper_force_limiter.defer_release = True
 
     def native_execution_status(self) -> Dict[str, Any]:
+        limiter_status = None if self._gripper_force_limiter is None else self._gripper_force_limiter.status()
         return {
             "fault": self._native_fault,
+            "fault_details": copy.deepcopy(self._native_fault_details),
+            "fault_consequences": tuple(self._native_fault_consequences),
             "update_generation": self._native_update_generation,
             "updated_monotonic": self._native_update_monotonic,
             "reference_sample": self._native_reference_sample,
@@ -379,11 +428,70 @@ class MotorChainRobot(Robot):
             "pending_reference_sequence": None
             if self._pending_reference is None
             else self._pending_reference[0].sequence,
-            "gripper_release_pending": bool(
-                self._gripper_force_limiter and self._gripper_force_limiter.release_pending
-            ),
-            "gripper_limited": bool(self._gripper_force_limiter and self._gripper_force_limiter._is_clogged),
+            "gripper_release_pending": bool(limiter_status and limiter_status["release_pending"]),
+            "gripper_limited": bool(limiter_status and limiter_status["contact_limited"]),
+            "gripper_effort_limiter": copy.deepcopy(limiter_status),
+            "effort_assessment": copy.deepcopy(self._native_effort_assessment),
+            "gripper_limit_reconciliation": copy.deepcopy(self._gripper_limit_reconciliation),
         }
+
+    def _record_native_fault(self, error: BaseException | str, details: Dict[str, Any] | None = None) -> None:
+        """Retain the first causal native fault and append later consequences."""
+        reason = str(error)
+        with self._fault_lock:
+            if self._native_fault is None:
+                self._native_fault = reason
+                self._native_fault_details = (
+                    copy.deepcopy(details)
+                    if details is not None
+                    else {
+                        "category": "native_execution",
+                        "severity": "fault",
+                        "reason": reason,
+                    }
+                )
+            elif reason != self._native_fault and reason not in self._native_fault_consequences:
+                self._native_fault_consequences.append(reason)
+
+    def _raise_feedback_fault(
+        self,
+        *,
+        category: str,
+        now: float,
+        observed: JointStates,
+        motors: list[MotorInfo],
+        index: int | None = None,
+        value: Any = None,
+        limit: Any = None,
+        units: str | None = None,
+        duration_s: float = 0.0,
+        requested_effort_nm: float | None = None,
+    ) -> None:
+        motor = None if index is None else motors[index]
+        coordinate = None if index is None else observed.names[index]
+        reason = f"native installation envelope exceeded: {category}"
+        if index is not None:
+            reason += f" at {coordinate} (motor {motor.id}): observed={value}, limit={limit} {units or ''}".rstrip()
+        details = {
+            "category": category,
+            "severity": "fault",
+            "reason": reason,
+            "motor_index": index,
+            "motor_id": None if motor is None else motor.id,
+            "public_coordinate": coordinate,
+            "observed_value": value,
+            "limit": limit,
+            "units": units,
+            "persistence_duration_s": duration_s,
+            "feedback_sweep_id": None if motor is None else motor.sweep_id,
+            "feedback_receive_sequence": None if motor is None else motor.receive_sequence,
+            "active_reference_sequence": None if self._reference is None else self._reference.sequence,
+            "estimated_requested_effort_nm": requested_effort_nm,
+            "detected_monotonic": now,
+        }
+        error = RuntimeError(reason)
+        self._record_native_fault(error, details)
+        raise error
 
     def request_controlled_braking(self) -> Optional[AdmittedReference]:
         """Cancel the next proposal; consume the active packet's admitted brake.
@@ -462,6 +570,7 @@ class MotorChainRobot(Robot):
             "use_coulomb_friction": self.use_coulomb_friction,
             "joint_limits": self._joint_limits,
             "gripper_limits": self._gripper_limits,
+            "gripper_limit_reconciliation": copy.deepcopy(self._gripper_limit_reconciliation),
             "gravity_comp_factor": self.gravity_comp_factor,
             "gripper_index": self._gripper_index,
             "enable_auto_recovery": getattr(self.motor_chain, "enable_auto_recovery", False),
@@ -471,6 +580,18 @@ class MotorChainRobot(Robot):
         }
         if self._gripper_index is not None:
             info["limit_gripper_effort"] = self._limit_gripper_force
+            info["gripper_effort_policy"] = (
+                None
+                if self._gripper_force_limiter is None
+                else {
+                    "closing_force_n": self._gripper_force_limiter.effort_policy.closing_force_n,
+                    "opening_force_n": self._gripper_force_limiter.effort_policy.opening_force_n,
+                    "release_deadband_normalized": (
+                        self._gripper_force_limiter.effort_policy.release_deadband_normalized
+                    ),
+                    "latch_persistence_s": self._gripper_force_limiter.effort_policy.latch_persistence_s,
+                }
+            )
         return info
 
     def start_server(self) -> None:
@@ -492,7 +613,7 @@ class MotorChainRobot(Robot):
             except Exception as error:
                 if self._reference is None:
                     raise  # Preserve the legacy thread behavior for legacy callers.
-                self._native_fault = str(error)
+                self._record_native_fault(error)
                 self._stop_event.set()
                 self.motor_chain.running = False
                 logging.exception("guarded native execution ended; fault is available through native_execution_status")
@@ -518,41 +639,159 @@ class MotorChainRobot(Robot):
             self._update_once()
         except Exception as error:
             if self._reference is not None:
-                self._native_fault = str(error)
+                self._record_native_fault(error)
                 self._stop_event.set()
                 self.motor_chain.running = False
             raise
 
-    def _check_native_feedback_limits(self, motors: list[MotorInfo], observed: JointStates, now: float) -> None:
+    def _check_native_feedback_limits(
+        self,
+        motors: list[MotorInfo],
+        observed: JointStates,
+        now: float,
+        requested_effort_nm: np.ndarray,
+    ) -> None:
         limits = self._feedback_limits
         if not np.all(np.isfinite((observed.pos, observed.vel))):
-            raise RuntimeError("native feedback position/velocity is nonfinite")
+            self._raise_feedback_fault(
+                category="nonfinite position/velocity feedback", now=now, observed=observed, motors=motors
+            )
         if limits is None:
             return  # Explicitly retained legacy/simulation fixture contract.
         stamps = [motor.received_monotonic for motor in motors]
         if np.ptp(stamps) > limits.maximum_sweep_skew_s or len({m.sweep_id for m in motors}) != 1:
-            raise RuntimeError("native feedback sweep is incoherent")
+            self._raise_feedback_fault(category="incoherent feedback sweep", now=now, observed=observed, motors=motors)
         effort = np.asarray([motor.eff for motor in motors])
         temperatures = np.asarray([[motor.temp_mos, motor.temp_rotor] for motor in motors])
         if not np.all(np.isfinite(effort)) or not np.all(np.isfinite(temperatures)) or np.any(temperatures < 0):
             # DAMIAO encodes temperatures as unsigned bytes. The API's -1
             # sentinel means no temperature measurement, not a cold motor.
-            raise RuntimeError("native motor effort/temperature feedback is unavailable or nonfinite")
+            self._raise_feedback_fault(
+                category="unavailable/nonfinite effort or temperature feedback",
+                now=now,
+                observed=observed,
+                motors=motors,
+            )
         positions = np.asarray(limits.position)
-        violations = {
-            "public joint travel": np.any(observed.pos < positions[:, 0] - limits.position_noise)
-            or np.any(observed.pos > positions[:, 1] + limits.position_noise),
-            "public joint velocity": np.any(np.abs(observed.vel) > limits.velocity),
-            "raw motor effort": np.any(np.abs(effort) > limits.motor_effort_nm),
-            "motor temperature": np.any(temperatures > np.asarray(limits.temperature_c)[:, None]),
+        active_keys: set[str] = set()
+
+        def persistent(key: str, threshold: float) -> float | None:
+            active_keys.add(key)
+            since = self._health_violation_since.setdefault(key, now)
+            duration = now - since
+            return duration if duration >= threshold else None
+
+        for index, value in enumerate(observed.pos):
+            lower = positions[index, 0] - limits.position_noise[index]
+            upper = positions[index, 1] + limits.position_noise[index]
+            if value < lower or value > upper:
+                duration = persistent(f"travel:{index}", limits.travel_persistence_s)
+                if duration is not None:
+                    self._raise_feedback_fault(
+                        category="public joint travel",
+                        now=now,
+                        observed=observed,
+                        motors=motors,
+                        index=index,
+                        value=float(value),
+                        limit=(float(lower), float(upper)),
+                        units="rad" if index != self._gripper_index else "normalized aperture",
+                        duration_s=duration,
+                    )
+        velocity_limits = np.asarray(limits.velocity)
+        velocity_exceeded = np.flatnonzero(np.abs(observed.vel) > velocity_limits)
+        if len(velocity_exceeded):
+            index = int(
+                velocity_exceeded[
+                    np.argmax(np.abs(observed.vel[velocity_exceeded]) / velocity_limits[velocity_exceeded])
+                ]
+            )
+            self._raise_feedback_fault(
+                category="public joint velocity decoder sanity",
+                now=now,
+                observed=observed,
+                motors=motors,
+                index=index,
+                value=float(observed.vel[index]),
+                limit=float(velocity_limits[index]),
+                units="rad/s" if index != self._gripper_index else "normalized aperture/s",
+            )
+
+        operating_limits = np.asarray(limits.operating_motor_effort_nm)
+        hard_limits = np.asarray(limits.hard_motor_effort_nm)
+        operating = []
+        for index, value in enumerate(effort):
+            if abs(value) > operating_limits[index]:
+                key = f"operating_effort:{index}"
+                active_keys.add(key)
+                since = self._health_violation_since.setdefault(key, now)
+                operating.append(
+                    {
+                        "motor_index": index,
+                        "motor_id": motors[index].id,
+                        "public_coordinate": observed.names[index],
+                        "observed_nm": float(value),
+                        "limit_nm": float(operating_limits[index]),
+                        "duration_s": now - since,
+                        "estimated_requested_nm": float(requested_effort_nm[index]),
+                    }
+                )
+            if abs(value) > hard_limits[index]:
+                duration = persistent(f"hard_effort:{index}", limits.hard_effort_persistence_s)
+                if duration is not None:
+                    self._raise_feedback_fault(
+                        category="hard raw motor effort",
+                        now=now,
+                        observed=observed,
+                        motors=motors,
+                        index=index,
+                        value=float(value),
+                        limit=float(hard_limits[index]),
+                        units="Nm",
+                        duration_s=duration,
+                        requested_effort_nm=float(requested_effort_nm[index]),
+                    )
+            if abs(requested_effort_nm[index]) > hard_limits[index]:
+                self._raise_feedback_fault(
+                    category="hard estimated commanded motor effort",
+                    now=now,
+                    observed=observed,
+                    motors=motors,
+                    index=index,
+                    value=float(requested_effort_nm[index]),
+                    limit=float(hard_limits[index]),
+                    units="Nm",
+                    requested_effort_nm=float(requested_effort_nm[index]),
+                )
+
+        temperature_limits = np.asarray(limits.temperature_c)
+        for index, pair in enumerate(temperatures):
+            value = float(np.max(pair))
+            if value > temperature_limits[index]:
+                duration = persistent(f"temperature:{index}", limits.temperature_persistence_s)
+                if duration is not None:
+                    self._raise_feedback_fault(
+                        category="motor temperature",
+                        now=now,
+                        observed=observed,
+                        motors=motors,
+                        index=index,
+                        value=value,
+                        limit=float(temperature_limits[index]),
+                        units="degC",
+                        duration_s=duration,
+                    )
+
+        for key in set(self._health_violation_since) - active_keys:
+            self._health_violation_since.pop(key, None)
+        self._native_effort_assessment = {
+            "observed_raw_motor_nm": tuple(float(value) for value in effort),
+            "estimated_requested_raw_motor_nm": tuple(float(value) for value in requested_effort_nm),
+            "operating_limits_nm": tuple(float(value) for value in operating_limits),
+            "hard_limits_nm": tuple(float(value) for value in hard_limits),
+            "operating_exceeded": tuple(operating),
+            "evaluated_monotonic": now,
         }
-        for name, exceeded in violations.items():
-            if exceeded:
-                since = self._health_violation_since.setdefault(name, now)
-                if now - since >= limits.persistence_s:
-                    raise RuntimeError(f"native installation envelope exceeded: {name}")
-            else:
-                self._health_violation_since.pop(name, None)
 
     def _update_once(self) -> None:
         """Update the robot.
@@ -572,15 +811,53 @@ class MotorChainRobot(Robot):
             try:
                 motors = self.motor_chain.read_states()
                 now = time.monotonic()
-                if any(
-                    m.error_code not in ("0x1", 1)
-                    or m.receive_sequence <= 0
-                    or not 0 <= now - m.received_monotonic <= self._feedback_max_age_s
-                    for m in motors
-                ):
-                    raise RuntimeError("native feedback unhealthy or stale")
+                # A native update may start just before a scheduled handoff and
+                # finish its feedback read just after it. Select the reference
+                # against the actual evaluation time so an expired predecessor
+                # cannot apply its braking/full-stiffness branch for one update.
+                with self._command_lock:
+                    if self._pending_reference is not None and now >= self._pending_reference[0].origin:
+                        self._reference, self._reference_gravity_idle = self._pending_reference
+                        self._pending_reference = None
+                    reference = self._reference
+                    gravity_idle = self._reference_gravity_idle
+                assert reference is not None
                 observed = self._motor_state_to_joint_state(motors)
-                self._check_native_feedback_limits(motors, observed, now)
+                for index, motor in enumerate(motors):
+                    if motor.error_code not in ("0x1", 1):
+                        self._raise_feedback_fault(
+                            category="motor firmware status",
+                            now=now,
+                            observed=observed,
+                            motors=motors,
+                            index=index,
+                            value=motor.error_code,
+                            limit="0x1 enabled/healthy",
+                            units="status",
+                        )
+                    if motor.receive_sequence <= 0:
+                        self._raise_feedback_fault(
+                            category="missing feedback progress",
+                            now=now,
+                            observed=observed,
+                            motors=motors,
+                            index=index,
+                            value=float(motor.receive_sequence),
+                            limit=1.0,
+                            units="receive sequence",
+                        )
+                    age = now - motor.received_monotonic
+                    if not 0 <= age <= self._feedback_max_age_s:
+                        self._raise_feedback_fault(
+                            category="stale feedback",
+                            now=now,
+                            observed=observed,
+                            motors=motors,
+                            index=index,
+                            value=float(age),
+                            limit=self._feedback_max_age_s,
+                            units="s",
+                        )
                 q, qd, qdd = reference.at(now)
                 check_from = (
                     (self._gripper_index if self._gripper_index is not None else len(motors))
@@ -590,22 +867,6 @@ class MotorChainRobot(Robot):
                 # Object-limited aperture mismatch is not an arm execution fault.
                 # Native jaw fault/status/range checks remain separate.
                 check_to = self._gripper_index if self._gripper_index is not None else len(motors)
-                if np.any(
-                    np.abs(observed.pos[check_from:check_to] - q[check_from:check_to])
-                    > reference.following_error[check_from:check_to]
-                ):
-                    raise RuntimeError(
-                        "native reference following corridor exceeded: "
-                        f"observed={observed.pos[check_from:check_to].tolist()}, "
-                        f"reference={q[check_from:check_to].tolist()}, command={reference.sequence}"
-                    )
-                velocity_error = np.abs(observed.vel[check_from:check_to] - qd[check_from:check_to])
-                if np.any(velocity_error > reference.following_velocity_error[check_from:check_to]):
-                    raise RuntimeError(
-                        "native reference velocity corridor exceeded: "
-                        f"observed={observed.vel[check_from:check_to].tolist()}, "
-                        f"reference={qd[check_from:check_to].tolist()}, command={reference.sequence}"
-                    )
                 joint_commands.pos = self.remapper.to_robot_joint_pos_space(q)
                 joint_commands.vel = self.remapper.to_robot_joint_vel_space(qd)
                 joint_commands.torques[:] = 0
@@ -637,7 +898,7 @@ class MotorChainRobot(Robot):
                             self._gripper_force_limiter.acknowledge_release()
                         self._gripper_release_sequence = reference.sequence
             except Exception as error:
-                self._native_fault = str(error)
+                self._record_native_fault(error)
                 self._stop_event.set()
                 self.motor_chain.running = False
                 raise
@@ -671,10 +932,14 @@ class MotorChainRobot(Robot):
                             self._gripper_index
                         ],
                         "last_command_qpos": self._last_gripper_command_qpos,
+                        "last_command_normalized_qpos": self._last_gripper_command_normalized_qpos,
                     }
 
                     self._gripper_force_limiter._kp = float(joint_commands.kp[self._gripper_index])
                     joint_commands.pos[self._gripper_index] = self._gripper_force_limiter.update(gripper_state)
+                    limiter_status = self._gripper_force_limiter.status()
+                    if limiter_status["contact_limited"] or limiter_status["release_pending"]:
+                        joint_commands.vel[self._gripper_index] = 0.0
 
                 # add final clip so the gripper won't be over-adjusted
                 joint_commands.pos[self._gripper_index] = np.clip(
@@ -683,6 +948,34 @@ class MotorChainRobot(Robot):
                     max(self._gripper_limits),
                 )
                 self._last_gripper_command_qpos = joint_commands.pos[self._gripper_index]
+                self._last_gripper_command_normalized_qpos = float(
+                    self.remapper.to_command_joint_pos_space(joint_commands.pos)[self._gripper_index]
+                )
+            raw_position = self.remapper.to_robot_joint_pos_space(self._joint_state.pos)
+            raw_velocity = self.remapper.to_robot_joint_vel_space(self._joint_state.vel)
+            estimated_requested_effort = (
+                motor_torques
+                + joint_commands.kp * (joint_commands.pos - raw_position)
+                + joint_commands.kd * (joint_commands.vel - raw_velocity)
+            )
+            if reference is not None:
+                self._check_native_feedback_limits(motors, observed, now, estimated_requested_effort)
+                if np.any(
+                    np.abs(observed.pos[check_from:check_to] - q[check_from:check_to])
+                    > reference.following_error[check_from:check_to]
+                ):
+                    raise RuntimeError(
+                        "native reference following corridor exceeded: "
+                        f"observed={observed.pos[check_from:check_to].tolist()}, "
+                        f"reference={q[check_from:check_to].tolist()}, command={reference.sequence}"
+                    )
+                velocity_error = np.abs(observed.vel[check_from:check_to] - qd[check_from:check_to])
+                if np.any(velocity_error > reference.following_velocity_error[check_from:check_to]):
+                    raise RuntimeError(
+                        "native reference velocity corridor exceeded: "
+                        f"observed={observed.vel[check_from:check_to].tolist()}, "
+                        f"reference={qd[check_from:check_to].tolist()}, command={reference.sequence}"
+                    )
             if not self._update_joint_state(motor_torques, joint_commands):
                 return
             self._native_update_generation += 1
@@ -704,6 +997,7 @@ class MotorChainRobot(Robot):
                     "kp_raw_motor": tuple(joint_commands.kp),
                     "kd_raw_motor": tuple(joint_commands.kd),
                     "feedforward_raw_motor_nm": tuple(motor_torques),
+                    "estimated_requested_raw_motor_nm": tuple(estimated_requested_effort),
                     "gravity_idle": bool(gravity_idle and now < reference.brake_at),
                 }
 

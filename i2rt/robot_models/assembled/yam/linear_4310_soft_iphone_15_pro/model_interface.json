@@ -87,16 +87,17 @@
         "linear_4310_soft_iphone_15_pro_max"
       ],
       "axes": {
-        "x": "forward",
-        "y": "left",
-        "z": "up"
+        "x": "right",
+        "y": "down",
+        "z": "forward"
       },
+      "convention": "optical-rdf/v1",
       "mjcf_site_name": "iphone_wide_camera_site",
       "parent": "iphone_mount",
       "rpy_deg": [
+        -102.5,
         0.0,
-        12.5,
-        0.0
+        -90.0
       ],
       "translation_m": [
         -0.0343,
@@ -106,12 +107,18 @@
     },
     "yam_tool": {
       "assemblies": "all",
+      "axes": {
+        "x": "right",
+        "y": "down",
+        "z": "forward"
+      },
+      "convention": "optical-rdf/v1",
       "mjcf_site_name": "grasp_site",
       "parent": "gripper",
       "quaternion_wxyz": [
         0.0,
-        1.0,
-        0.0,
+        0.7071067811865476,
+        0.7071067811865476,
         0.0
       ],
       "translation_m": [
@@ -137,7 +144,7 @@
   "schema_version": "yam-coordinate-map/v1",
   "source": {
     "config_schema": "yam-model/v1",
-    "config_sha256": "270f15d0b9e7bc5ecc429cfdea0b26eda9129cbf103e07eb32019c280a4dc7a6",
+    "config_sha256": "409e9484d35dcace2c5b4786c40d072ee21228f3e4143f213e48ab8643382dc4",
     "urdf": "source/assemblies/linear_4310_soft_iphone_15_pro/yam.urdf",
     "urdf_sha256": "832b923075ce5f0a679dfa9615ce47f4889350fec69d2d143447599bd386f5c6"
   }
